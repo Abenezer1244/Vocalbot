@@ -188,7 +188,8 @@ def init_db():
       day INTEGER NOT NULL CHECK(day IN (1,2,3)),
       minutes INTEGER NOT NULL,
       ts TEXT NOT NULL,
-      UNIQUE(telegram_id, week_start, day)
+      local_date TEXT
+      -- NOTE: uniqueness is enforced via index created below
     )""")
     c.execute("""
     CREATE TABLE IF NOT EXISTS reminders(
@@ -198,6 +199,39 @@ def init_db():
       minute INTEGER NOT NULL
     )""")
     conn.commit()
+
+    # Ensure 'local_date' column exists (older DBs might not have it)
+    cols = {row[1] for row in c.execute("PRAGMA table_info(checkins)").fetchall()}
+    if "local_date" not in cols:
+        c.execute("ALTER TABLE checkins ADD COLUMN local_date TEXT")
+        conn.commit()
+
+    # Backfill local_date where missing, using Pacific time if available
+    rows = c.execute("SELECT id, ts FROM checkins WHERE local_date IS NULL OR local_date=''").fetchall()
+    for cid, ts in rows:
+        local_date = None
+        try:
+            dt = datetime.datetime.fromisoformat(ts)
+            if LOCAL_TZ:
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=LOCAL_TZ)
+                else:
+                    dt = dt.astimezone(LOCAL_TZ)
+            local_date = dt.date().isoformat()
+        except Exception:
+            # fallback: best-effort date parse
+            local_date = ts.split("T")[0] if "T" in ts else ts[:10]
+        c.execute("UPDATE checkins SET local_date=? WHERE id=?", (local_date, cid))
+    conn.commit()
+
+    # Create a UNIQUE daily index so a user can log at most once per calendar day
+    try:
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_checkins_daily ON checkins(telegram_id, local_date)")
+        conn.commit()
+    except Exception as e:
+        # If historic duplicates exist, index creation can fail; the code-level guard still prevents new ones.
+        log.warning("Could not create daily unique index (existing duplicates?). Guard will be enforced in code. %s", e)
+
     conn.close()
 
 # ---------------- Helpers ----------------
@@ -427,24 +461,40 @@ async def cb_day(update: Update, _: ContextTypes.DEFAULT_TYPE):
         return
     team_name = row[0]
     wk = week_start_iso()
-    ts = datetime.datetime.now(tz=LOCAL_TZ).isoformat(timespec="seconds") if LOCAL_TZ else \
-         datetime.datetime.now().isoformat(timespec="seconds")
+
+    # Current timestamp & local Pacific date
+    now = datetime.datetime.now(tz=LOCAL_TZ) if LOCAL_TZ else datetime.datetime.now()
+    ts = now.isoformat(timespec="seconds")
+    local_date = now.date().isoformat()
+
+    # NEW: block multiple check-ins on the same calendar day
+    c.execute("SELECT 1 FROM checkins WHERE telegram_id=? AND local_date=?", (user.id, local_date))
+    if c.fetchone():
+        conn.close()
+        await q.edit_message_text(
+            f"You’ve already checked in today ({local_date}). "
+            f"Please come back tomorrow to log Day {day}."
+        )
+        return
 
     try:
         c.execute(
-            """INSERT INTO checkins(telegram_id, team_name, week_start, day, minutes, ts)
-               VALUES (?,?,?,?,?,?)""",
-            (user.id, team_name, wk, day, DEFAULT_MINUTES, ts),
+            """INSERT INTO checkins(telegram_id, team_name, week_start, day, minutes, ts, local_date)
+               VALUES (?,?,?,?,?,?,?)""",
+            (user.id, team_name, wk, day, DEFAULT_MINUTES, ts, local_date),
         )
         conn.commit()
         msg = f"Logged {team_name}: Day {day} ✅ ({DEFAULT_MINUTES} min)"
         log_to_sheet(team_name, day, DEFAULT_MINUTES, ts, wk, user.id)
     except sqlite3.IntegrityError:
+        # This still covers the per-week 'same Day twice' case
         msg = f"{team_name}: Day {day} already logged this week."
     finally:
         conn.close()
 
     await q.edit_message_text(msg)
+
+
 
 async def week(update: Update, _: ContextTypes.DEFAULT_TYPE):
     wk = week_start_iso()
