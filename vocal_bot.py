@@ -1,27 +1,12 @@
 # vocal_bot.py
-# Requirements:
-#   pip install python-telegram-bot==21.4 python-dotenv==1.0.1
-#   # Optional for Google Sheets mirroring:
-#   pip install gspread google-auth
-#
-# .env variables:
-#   BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN
-#   # Optional Google Sheets:
-#   # SHEETS_ID=YOUR_GOOGLE_SHEET_ID
-#   # GOOGLE_APPLICATION_CREDENTIALS=service_account.json
-
 import os
 import sqlite3
 import datetime
 import logging
 from typing import Dict, List, Tuple, Optional
+
 from dotenv import load_dotenv
-DEFAULT_MINUTES = int(os.getenv("DEFAULT_MINUTES", "20"))
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -30,75 +15,118 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ---------- Logging ----------
+# ---------------- Logging ----------------
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s | %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger("vocal-bot")
 
-# ---------- Config & Env ----------
+# ---------------- Env & Config ----------------
 load_dotenv()
+
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
-    raise SystemExit("ERROR: BOT_TOKEN missing in .env")
+    raise SystemExit("BOT_TOKEN missing. Set it in your environment or .env.")
 
-# Fixed roster (edit if your team changes)
+# Team roster (edit to your singers)
 TEAM = ["Isayas", "Sahara", "Zufan", "Mike", "Sami", "Barok", "Betty", "Ruth"]
 
+# Minutes per session (override with env if desired)
+DEFAULT_MINUTES = int(os.getenv("DEFAULT_MINUTES", "20"))
 
-
-# Local default (your Windows folder)
-DB_DIR_LOCAL = r"C:\Users\Windows\OneDrive - Seattle Colleges\Desktop\Vocalbot"
-os.makedirs(DB_DIR_LOCAL, exist_ok=True)
-DB_PATH = os.getenv("DB_PATH", os.path.join(DB_DIR_LOCAL, "progress.db"))
-# (Render will override DB_PATH with /var/data/progress.db)
-
-
-# Timezone: lock to Pacific
+# Timezone (Pacific)
 try:
-    from zoneinfo import ZoneInfo  # Python 3.9+
+    from zoneinfo import ZoneInfo  # py>=3.9
     LOCAL_TZ = ZoneInfo("America/Los_Angeles")
     TZ_LABEL = "Pacific (America/Los_Angeles)"
-except Exception as e:
+except Exception:
     LOCAL_TZ = None
     TZ_LABEL = "Pacific"
 
-# Optional Google Sheets (mirroring check-ins)
+# Database path
+# Local Windows default (your OneDrive path) — Render should override with DB_PATH
+DB_DIR_LOCAL = r"C:\Users\Windows\OneDrive - Seattle Colleges\Desktop\Vocalbot"
+os.makedirs(DB_DIR_LOCAL, exist_ok=True)
+DB_PATH = os.getenv("DB_PATH", os.path.join(DB_DIR_LOCAL, "progress.db"))
+
+# Ensure DB directory exists (works on Render and local)
+os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+
+# ---------------- Optional Google Sheets ----------------
 SHEETS_ID = os.getenv("SHEETS_ID", "").strip()
 GS_ENABLED = False
 gc = None
-sheet = None
+
 if SHEETS_ID:
     try:
         import gspread
         from google.oauth2.service_account import Credentials
+
         SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-        creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip() or "service_account.json"
+        creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
+        if not creds_path:
+            raise RuntimeError("GOOGLE_APPLICATION_CREDENTIALS env var is not set")
         creds = Credentials.from_service_account_file(creds_path, scopes=SCOPES)
         gc = gspread.authorize(creds)
-        sheet = gc.open_by_key(SHEETS_ID).worksheet("Checkins")
         GS_ENABLED = True
         log.info("Google Sheets mirroring ENABLED.")
     except Exception as e:
         log.warning("Google Sheets not available/failed to init: %s", e)
         GS_ENABLED = False
 
-def log_to_sheet(team_name: str, day: int, minutes: int, ts_iso: str, week_start_iso: str, telegram_id: int) -> None:
+# --- Sheets helpers & worksheets (created on demand) ---
+def _open_sheet():
+    if not GS_ENABLED:
+        return None
+    return gc.open_by_key(SHEETS_ID)
+
+def _get_ws(title: str):
+    if not GS_ENABLED:
+        return None
+    sh = _open_sheet()
+    try:
+        return sh.worksheet(title)
+    except Exception:
+        try:
+            return sh.add_worksheet(title=title, rows=2000, cols=12)
+        except Exception:
+            return None
+
+def _append_row(ws, row: List):
+    if ws:
+        ws.append_row(row)
+
+def _get_records(ws) -> List[Dict]:
+    if not ws:
+        return []
+    try:
+        return ws.get_all_records()
+    except Exception:
+        return []
+
+WS_CHECKINS = None
+WS_USERS = None
+WS_REMINDERS = None
+if GS_ENABLED:
+    WS_CHECKINS = _get_ws("Checkins")    # [team_name, "Day N", minutes, ts_iso, week_start_iso, telegram_id]
+    WS_USERS = _get_ws("Users")          # [telegram_id, team_name]
+    WS_REMINDERS = _get_ws("Reminders")  # [telegram_id, days_csv, hour, minute]
+
+def log_to_sheet(team_name: str, day: int, minutes: int, ts_iso: str, week_start_iso: str, telegram_id: int):
     if not GS_ENABLED:
         return
-    try:
-        sheet.append_row([team_name, f"Day {day}", minutes, ts_iso, week_start_iso, str(telegram_id)])
-    except Exception as e:
-        log.warning("Failed to append to sheet: %s", e)
+    _append_row(WS_CHECKINS, [team_name, f"Day {day}", minutes, ts_iso, week_start_iso, str(telegram_id)])
 
-# ---------- Database ----------
+# ---------------- Database ----------------
 def db():
+    # ensure directory exists
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
-def init_db() -> None:
+def init_db():
     conn = db()
     c = conn.cursor()
     c.execute("""
@@ -109,25 +137,25 @@ def init_db() -> None:
     c.execute("""
     CREATE TABLE IF NOT EXISTS checkins(
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      telegram_id INTEGER NOT NULL,
+      telegram_id INTEGER,
       team_name TEXT NOT NULL,
-      week_start TEXT NOT NULL,   -- ISO date for Monday of the week
+      week_start TEXT NOT NULL,
       day INTEGER NOT NULL CHECK(day IN (1,2,3)),
       minutes INTEGER NOT NULL,
-      ts TEXT NOT NULL,           -- ISO timestamp
+      ts TEXT NOT NULL,
       UNIQUE(telegram_id, week_start, day)
     )""")
     c.execute("""
     CREATE TABLE IF NOT EXISTS reminders(
       telegram_id INTEGER PRIMARY KEY,
-      days_csv TEXT NOT NULL,     -- e.g., "MON,WED,FRI"
+      days_csv TEXT NOT NULL,
       hour INTEGER NOT NULL,
       minute INTEGER NOT NULL
     )""")
     conn.commit()
     conn.close()
 
-# ---------- Helpers ----------
+# ---------------- Helpers ----------------
 WEEKDAY_MAP: Dict[str, int] = {"MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4, "SAT": 5, "SUN": 6}
 REV_WEEKDAY_MAP: Dict[int, str] = {v: k for k, v in WEEKDAY_MAP.items()}
 
@@ -136,10 +164,9 @@ def week_start_iso(d: Optional[datetime.date] = None) -> str:
     start = d - datetime.timedelta(days=d.weekday())  # Monday
     return start.isoformat()
 
-def week_end_iso(wk_start_iso: str) -> str:
-    start = datetime.date.fromisoformat(wk_start_iso)
-    end = start + datetime.timedelta(days=6)
-    return end.isoformat()
+def week_end_iso(wk: str) -> str:
+    start = datetime.date.fromisoformat(wk)
+    return (start + datetime.timedelta(days=6)).isoformat()
 
 def kb_days() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
@@ -149,12 +176,12 @@ def kb_days() -> InlineKeyboardMarkup:
     ]])
 
 def parse_days_csv(s: str) -> List[int]:
-    days: List[int] = []
+    out: List[int] = []
     for part in s.split(","):
         d = part.strip().upper()
         if d in WEEKDAY_MAP:
-            days.append(WEEKDAY_MAP[d])
-    return sorted(set(days))
+            out.append(WEEKDAY_MAP[d])
+    return sorted(set(out))
 
 def normalize_days_to_csv(days: List[int]) -> str:
     return ",".join(REV_WEEKDAY_MAP[d] for d in sorted(days))
@@ -170,11 +197,9 @@ def parse_time_hhmm(s: str) -> Optional[Tuple[int, int]]:
     return None
 
 def parse_week_rows() -> Dict[str, Dict[int, str]]:
-    """Return mapping: name -> {1:'✅'/'  ', 2:..., 3:...} for CURRENT week."""
     wk = week_start_iso()
     status: Dict[str, Dict[int, str]] = {n: {1: "  ", 2: "  ", 3: "  "} for n in TEAM}
-    conn = db()
-    c = conn.cursor()
+    conn = db(); c = conn.cursor()
     c.execute("SELECT team_name, day FROM checkins WHERE week_start=?", (wk,))
     for name, day in c.fetchall():
         if name in status and day in status[name]:
@@ -182,7 +207,57 @@ def parse_week_rows() -> Dict[str, Dict[int, str]]:
     conn.close()
     return status
 
-# ---------- Handlers ----------
+# ---------------- Hydration from Sheets (so no disk is required) ----------------
+def hydrate_from_sheets():
+    if not GS_ENABLED:
+        return
+    conn = db(); c = conn.cursor()
+
+    # Users
+    for r in _get_records(WS_USERS):
+        try:
+            tg = int(str(r.get("telegram_id", "")).strip())
+            name = str(r.get("team_name", "")).strip()
+            if tg and name:
+                c.execute("REPLACE INTO users(telegram_id, team_name) VALUES(?,?)", (tg, name))
+        except Exception:
+            pass
+
+    # Checkins
+    for r in _get_records(WS_CHECKINS):
+        try:
+            name = str(r.get("team_name", "")).strip()
+            day_s = str(r.get("day", "")).strip().replace("Day", "").strip()
+            day = int(day_s) if day_s.isdigit() else None
+            minutes = int(str(r.get("minutes", "20")).strip() or "20")
+            ts = str(r.get("ts", "")).strip() or str(r.get("timestamp", "")).strip()
+            wk = str(r.get("week_start", "")).strip()
+            tg = int(str(r.get("telegram_id", "")).strip()) if r.get("telegram_id") else None
+            if name and day in (1, 2, 3) and wk:
+                c.execute("""INSERT OR IGNORE INTO checkins
+                             (telegram_id, team_name, week_start, day, minutes, ts)
+                             VALUES (?,?,?,?,?,?)""",
+                          (tg, name, wk, day, minutes, ts or ""))
+        except Exception:
+            pass
+
+    # Reminders
+    for r in _get_records(WS_REMINDERS):
+        try:
+            tg = int(str(r.get("telegram_id", "")).strip())
+            days_csv = str(r.get("days_csv", "")).strip()
+            hour = int(str(r.get("hour", "19")).strip() or "19")
+            minute = int(str(r.get("minute", "0")).strip() or "0")
+            if tg and days_csv:
+                c.execute("""REPLACE INTO reminders(telegram_id, days_csv, hour, minute)
+                             VALUES (?,?,?,?)""", (tg, days_csv, hour, minute))
+        except Exception:
+            pass
+
+    conn.commit(); conn.close()
+    log.info("Hydrated local state from Google Sheets.")
+
+# ---------------- Handlers ----------------
 async def help_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Commands:\n"
@@ -194,10 +269,10 @@ async def help_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "/leaderboard — Weekly standings\n"
         "/streaks — Consecutive full weeks (3/3)\n"
         "/history — Last 4 weeks summary\n"
-        "/remind <DAYS> <HH:MM> — Personal DM reminders in Pacific (e.g., /remind MON,WED,FRI 19:30)\n"
+        "/remind <DAYS> <HH:MM> — Personal DM reminders (Pacific)\n"
         "/myreminders — Show your reminder schedule\n"
-        "/stopreminders — Turn off your personal reminders\n"
-        "/timezone — Show the bot reminder timezone\n"
+        "/stopreminders — Turn off your reminders\n"
+        "/timezone — Show reminder timezone\n"
         "(All reminder times are interpreted in Pacific Time.)"
     )
 
@@ -220,12 +295,23 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if name not in TEAM:
         await update.message.reply_text(f"Name must be one of: {', '.join(TEAM)}")
         return
-    conn = db()
-    c = conn.cursor()
+    conn = db(); c = conn.cursor()
     c.execute("REPLACE INTO users(telegram_id, team_name) VALUES(?,?)", (update.effective_user.id, name))
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
     await update.message.reply_text(f"Registered as {name}. Use /checkin to log!")
+
+    # Sync to Sheets
+    if GS_ENABLED and WS_USERS:
+        tg = update.effective_user.id
+        rows = _get_records(WS_USERS)
+        found = False
+        for idx, r in enumerate(rows, start=2):
+            if str(r.get("telegram_id", "")).strip() == str(tg):
+                WS_USERS.update(f"A{idx}:B{idx}", [[str(tg), name]])
+                found = True
+                break
+        if not found:
+            _append_row(WS_USERS, [str(tg), name])
 
 async def checkin(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Tap the day you completed (20 min):", reply_markup=kb_days())
@@ -236,8 +322,7 @@ async def cb_day(update: Update, _: ContextTypes.DEFAULT_TYPE):
     day = int(q.data.split(":")[1])
     user = q.from_user
 
-    conn = db()
-    c = conn.cursor()
+    conn = db(); c = conn.cursor()
     c.execute("SELECT team_name FROM users WHERE telegram_id=?", (user.id,))
     row = c.fetchone()
     if not row:
@@ -284,13 +369,9 @@ async def week(update: Update, _: ContextTypes.DEFAULT_TYPE):
 async def leaderboard(update: Update, _: ContextTypes.DEFAULT_TYPE):
     wk = week_start_iso()
     scores: Dict[str, int] = {n: 0 for n in TEAM}
-    conn = db()
-    c = conn.cursor()
-    c.execute(
-        """SELECT team_name, COUNT(DISTINCT day) FROM checkins
-           WHERE week_start=? GROUP BY team_name""",
-        (wk,),
-    )
+    conn = db(); c = conn.cursor()
+    c.execute("""SELECT team_name, COUNT(DISTINCT day) FROM checkins
+                 WHERE week_start=? GROUP BY team_name""", (wk,))
     for name, cnt in c.fetchall():
         if name in scores:
             scores[name] = min(3, cnt)
@@ -305,13 +386,12 @@ async def leaderboard(update: Update, _: ContextTypes.DEFAULT_TYPE):
 async def me(update: Update, _: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     wk = week_start_iso()
-    conn = db()
-    c = conn.cursor()
+    conn = db(); c = conn.cursor()
     c.execute("SELECT team_name FROM users WHERE telegram_id=?", (user.id,))
     row = c.fetchone()
     if not row:
-        await update.message.reply_text("Not registered yet. Use /register <Name>.")
         conn.close()
+        await update.message.reply_text("Not registered yet. Use /register <Name>.")
         return
     name = row[0]
     c.execute("SELECT DISTINCT day FROM checkins WHERE telegram_id=? AND week_start=?", (user.id, wk))
@@ -323,37 +403,28 @@ async def me(update: Update, _: ContextTypes.DEFAULT_TYPE):
 async def undo(update: Update, _: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     wk = week_start_iso()
-    conn = db()
-    c = conn.cursor()
-    c.execute(
-        """SELECT id, day, ts FROM checkins
-           WHERE telegram_id=? AND week_start=?
-           ORDER BY ts DESC LIMIT 1""",
-        (user.id, wk),
-    )
+    conn = db(); c = conn.cursor()
+    c.execute("""SELECT id, day, ts FROM checkins
+                 WHERE telegram_id=? AND week_start=?
+                 ORDER BY ts DESC LIMIT 1""", (user.id, wk))
     row = c.fetchone()
     if not row:
-        await update.message.reply_text("No check-ins to undo this week.")
         conn.close()
+        await update.message.reply_text("No check-ins to undo this week.")
         return
     checkin_id, day, ts = row
     c.execute("DELETE FROM checkins WHERE id=?", (checkin_id,))
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
     await update.message.reply_text(f"Removed your last check-in: Day {day} ({ts})")
 
 async def streaks(update: Update, _: ContextTypes.DEFAULT_TYPE):
-    conn = db()
-    c = conn.cursor()
+    conn = db(); c = conn.cursor()
     streak_map: Dict[str, int] = {}
     for name in TEAM:
         streak = 0
-        c.execute(
-            """SELECT week_start, COUNT(DISTINCT day)
-               FROM checkins WHERE team_name=?
-               GROUP BY week_start ORDER BY week_start DESC""",
-            (name,),
-        )
+        c.execute("""SELECT week_start, COUNT(DISTINCT day)
+                     FROM checkins WHERE team_name=?
+                     GROUP BY week_start ORDER BY week_start DESC""", (name,))
         for wk, cnt in c.fetchall():
             if cnt == 3:
                 streak += 1
@@ -361,7 +432,6 @@ async def streaks(update: Update, _: ContextTypes.DEFAULT_TYPE):
                 break
         streak_map[name] = streak
     conn.close()
-
     lines = ["*Streaks (consecutive full weeks)*", ""]
     for n in TEAM:
         lines.append(f"{n}: {streak_map[n]} 🔥")
@@ -369,26 +439,22 @@ async def streaks(update: Update, _: ContextTypes.DEFAULT_TYPE):
 
 async def history(update: Update, _: ContextTypes.DEFAULT_TYPE):
     N = 4
-    conn = db()
-    c = conn.cursor()
+    conn = db(); c = conn.cursor()
     c.execute("SELECT DISTINCT week_start FROM checkins ORDER BY week_start DESC LIMIT ?", (N,))
     weeks = [wk for (wk,) in c.fetchall()]
     lines: List[str] = [f"*History (last {N} weeks)*", ""]
     for wk in weeks:
         lines.append(f"Week {wk} → {week_end_iso(wk)}")
         for n in TEAM:
-            c.execute(
-                """SELECT COUNT(DISTINCT day) FROM checkins
-                   WHERE team_name=? AND week_start=?""",
-                (n, wk),
-            )
+            c.execute("""SELECT COUNT(DISTINCT day) FROM checkins
+                         WHERE team_name=? AND week_start=?""", (n, wk))
             cnt = c.fetchone()[0]
             lines.append(f"  {n}: {cnt}/3")
         lines.append("")
     conn.close()
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
-# ---------- Personal Reminders (DM) ----------
+# ---------------- Personal Reminders ----------------
 from datetime import time as dtime
 
 async def personal_reminder_job(context: ContextTypes.DEFAULT_TYPE):
@@ -398,15 +464,12 @@ async def personal_reminder_job(context: ContextTypes.DEFAULT_TYPE):
         text="🎶 Friendly reminder: aim for 20 minutes today. Use /checkin when you finish!"
     )
 
-def schedule_user_reminders(application: Application, telegram_id: int, days: List[int], hour: int, minute: int) -> None:
-    # Remove existing jobs for this user
+def schedule_user_reminders(application: Application, telegram_id: int, days: List[int], hour: int, minute: int):
+    # Clear old jobs for this user
     for j in application.job_queue.get_jobs_by_name(f"rem-{telegram_id}"):
         j.schedule_removal()
 
-    # Time with Pacific TZ
     t = dtime(hour=hour, minute=minute, tzinfo=LOCAL_TZ) if LOCAL_TZ else dtime(hour=hour, minute=minute)
-
-    # Schedule daily jobs per weekday (DM)
     for wd in days:
         application.job_queue.run_daily(
             personal_reminder_job,
@@ -416,28 +479,20 @@ def schedule_user_reminders(application: Application, telegram_id: int, days: Li
             chat_id=telegram_id,
         )
 
-def restore_all_user_reminders(application: Application) -> None:
-    conn = db()
-    c = conn.cursor()
+def restore_all_user_reminders(application: Application):
+    conn = db(); c = conn.cursor()
     c.execute("SELECT telegram_id, days_csv, hour, minute FROM reminders")
-    rows = c.fetchall()
-    conn.close()
+    rows = c.fetchall(); conn.close()
     for telegram_id, days_csv, hour, minute in rows:
         days = parse_days_csv(days_csv)
         if days:
-            schedule_user_reminders(application, int(telegram_id), int(hour), int(minute))
+            schedule_user_reminders(application, int(telegram_id), days, int(hour), int(minute))
 
 async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    /remind <DAYS> <HH:MM>
-    Example: /remind MON,WED,FRI 19:30
-    """
     user = update.effective_user
     if len(context.args) < 2:
         await update.message.reply_text(
-            "Usage: /remind <DAYS> <HH:MM>\n"
-            "Example: /remind TUE,THU,SAT 19:00\n"
-            f"Times are interpreted in {TZ_LABEL}."
+            "Usage: /remind <DAYS> <HH:MM>\nExample: /remind MON,WED,FRI 19:30\nTimes are interpreted in Pacific."
         )
         return
 
@@ -455,19 +510,26 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     hour, minute = hm
 
-    # Save to DB
-    conn = db()
-    c = conn.cursor()
-    c.execute(
-        """REPLACE INTO reminders(telegram_id, days_csv, hour, minute)
-           VALUES (?,?,?,?)""",
-        (user.id, normalize_days_to_csv(days), hour, minute),
-    )
-    conn.commit()
-    conn.close()
+    conn = db(); c = conn.cursor()
+    c.execute("""REPLACE INTO reminders(telegram_id, days_csv, hour, minute)
+                 VALUES (?,?,?,?)""", (user.id, normalize_days_to_csv(days), hour, minute))
+    conn.commit(); conn.close()
 
-    # Schedule jobs
     schedule_user_reminders(context.application, user.id, days, hour, minute)
+
+    # Sync to Sheets
+    if GS_ENABLED and WS_REMINDERS:
+        tg = user.id
+        rows = _get_records(WS_REMINDERS)
+        payload = [str(tg), normalize_days_to_csv(days), hour, minute]
+        found = False
+        for idx, r in enumerate(rows, start=2):
+            if str(r.get("telegram_id", "")).strip() == str(tg):
+                WS_REMINDERS.update(f"A{idx}:D{idx}", [payload])
+                found = True
+                break
+        if not found:
+            _append_row(WS_REMINDERS, payload)
 
     day_labels = ",".join(REV_WEEKDAY_MAP[d] for d in days)
     await update.message.reply_text(
@@ -476,38 +538,45 @@ async def remind(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def myreminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    conn = db()
-    c = conn.cursor()
+    conn = db(); c = conn.cursor()
     c.execute("SELECT days_csv, hour, minute FROM reminders WHERE telegram_id=?", (user.id,))
-    row = c.fetchone()
-    conn.close()
+    row = c.fetchone(); conn.close()
     if not row:
         await update.message.reply_text("You don’t have personal reminders set. Use /remind <DAYS> <HH:MM>.")
         return
     days_csv, hour, minute = row
-    await update.message.reply_text(
-        f"Your reminders: {days_csv} at {hour:02d}:{minute:02d} {TZ_LABEL} (sent via DM)."
-    )
+    await update.message.reply_text(f"Your reminders: {days_csv} at {hour:02d}:{minute:02d} {TZ_LABEL} (sent via DM).")
 
 async def stopreminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    conn = db()
-    c = conn.cursor()
+    conn = db(); c = conn.cursor()
     c.execute("DELETE FROM reminders WHERE telegram_id=?", (user.id,))
-    conn.commit()
-    conn.close()
+    conn.commit(); conn.close()
 
     for j in context.application.job_queue.get_jobs_by_name(f"rem-{user.id}"):
         j.schedule_removal()
 
+    # Sync to Sheets
+    if GS_ENABLED and WS_REMINDERS:
+        tg = user.id
+        rows = _get_records(WS_REMINDERS)
+        for idx, r in enumerate(rows, start=2):
+            if str(r.get("telegram_id", "")).strip() == str(tg):
+                WS_REMINDERS.delete_rows(idx)
+                break
+
     await update.message.reply_text("🛑 Your personal reminders are turned off.")
 
-# ---------- Main ----------
+# ---------------- Main ----------------
 def main():
     init_db()
+
+    # If you want zero data loss without a Render disk, keep SHEETS_ID set and use
+    # DB_PATH=/tmp/progress.db — the next call rebuilds local state from Sheets:
+    hydrate_from_sheets()
+
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Commands
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("timezone", timezone_cmd))
@@ -524,7 +593,6 @@ def main():
     app.add_handler(CommandHandler("stopreminders", stopreminders))
     app.add_handler(CallbackQueryHandler(cb_day, pattern=r"^day:\d$"))
 
-    # Restore per-user reminder jobs from DB
     restore_all_user_reminders(app)
 
     log.info("Bot running. Press Ctrl+C to stop.")
@@ -532,5 +600,6 @@ def main():
         allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"],
         drop_pending_updates=True
     )
+
 if __name__ == "__main__":
     main()
