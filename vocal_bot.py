@@ -16,7 +16,7 @@ import datetime
 import logging
 from typing import Dict, List, Tuple, Optional
 from dotenv import load_dotenv
-
+DEFAULT_MINUTES = int(os.getenv("DEFAULT_MINUTES", "20"))
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -528,11 +528,9 @@ def main():
     restore_all_user_reminders(app)
 
     log.info("Bot running. Press Ctrl+C to stop.")
-    app.run_polling(allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"])
-
-if __name__ == "__main__":
     app.run_polling(
-    allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"],
-    drop_pending_updates=True
-)
+        allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"],
+        drop_pending_updates=True
+    )
+if __name__ == "__main__":
     main()
