@@ -15,6 +15,12 @@ from telegram.ext import (
     ContextTypes,
 )
 
+
+def on_render_web_service() -> bool:
+    # Web Services have PORT and RENDER_EXTERNAL_URL at runtime
+    return bool(os.getenv("PORT") and os.getenv("RENDER_EXTERNAL_URL"))
+
+
 # ---------------- Logging ----------------
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s | %(message)s",
@@ -595,11 +601,33 @@ def main():
 
     restore_all_user_reminders(app)
 
-    log.info("Bot running. Press Ctrl+C to stop.")
-    app.run_polling(
-        allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"],
-        drop_pending_updates=True
-    )
+    log.info("Bot starting...")
+
+    if on_render_web_service():
+        # --- WEBHOOK MODE for Render Web Service (FREE) ---
+        port = int(os.getenv("PORT", "10000"))
+        base = os.getenv("WEBHOOK_BASE") or os.getenv("RENDER_EXTERNAL_URL")
+        if not base:
+            raise SystemExit("WEBHOOK_BASE or RENDER_EXTERNAL_URL not set")
+
+        webhook_url = f"{base.rstrip('/')}/{BOT_TOKEN}"
+        log.info(f"Using webhook URL: {webhook_url}")
+
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=BOT_TOKEN,      # Telegram will POST to /<token>
+            webhook_url=webhook_url, # Public https URL
+            allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"],
+            drop_pending_updates=True,
+        )
+    else:
+        # --- LOCAL / WORKER MODE (long-polling) ---
+        app.run_polling(
+            allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"],
+            drop_pending_updates=True,
+        )
+
 
 if __name__ == "__main__":
     main()
