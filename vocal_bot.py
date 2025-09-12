@@ -46,9 +46,14 @@ if not BOT_TOKEN:
 # Fixed roster (edit if your team changes)
 TEAM = ["Isayas", "Sahara", "Zufan", "Mike", "Sami", "Barok", "Betty", "Ruth"]
 
-DEFAULT_MINUTES = 20
-DB_PATH = r"C:\Users\Windows\OneDrive - Seattle Colleges\Desktop\Vocalbot\progress.db"
-os.makedirs(r"C:\Users\Windows\OneDrive - Seattle Colleges\Desktop\Vocalbot", exist_ok=True)
+
+
+# Local default (your Windows folder)
+DB_DIR_LOCAL = r"C:\Users\Windows\OneDrive - Seattle Colleges\Desktop\Vocalbot"
+os.makedirs(DB_DIR_LOCAL, exist_ok=True)
+DB_PATH = os.getenv("DB_PATH", os.path.join(DB_DIR_LOCAL, "progress.db"))
+# (Render will override DB_PATH with /var/data/progress.db)
+
 
 # Timezone: lock to Pacific
 try:
@@ -526,4 +531,8 @@ def main():
     app.run_polling(allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"])
 
 if __name__ == "__main__":
+    app.run_polling(
+    allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"],
+    drop_pending_updates=True
+)
     main()
