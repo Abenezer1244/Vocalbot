@@ -47,7 +47,8 @@ if not BOT_TOKEN:
 TEAM = ["Isayas", "Sahara", "Zufan", "Mike", "Sami", "Barok", "Betty", "Ruth"]
 
 DEFAULT_MINUTES = 20
-DB_PATH = os.getenv("DB_PATH", "progress.db")
+DB_PATH = r"C:\Users\Windows\OneDrive - Seattle Colleges\Desktop\Vocalbot\progress.db"
+os.makedirs(r"C:\Users\Windows\OneDrive - Seattle Colleges\Desktop\Vocalbot", exist_ok=True)
 
 # Timezone: lock to Pacific
 try:
