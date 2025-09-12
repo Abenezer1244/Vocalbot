@@ -4,6 +4,8 @@ import sqlite3
 import datetime
 import logging
 from typing import Dict, List, Tuple, Optional
+from telegram.ext import JobQueue
+
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -471,19 +473,29 @@ async def personal_reminder_job(context: ContextTypes.DEFAULT_TYPE):
     )
 
 def schedule_user_reminders(application: Application, telegram_id: int, days: List[int], hour: int, minute: int):
+    # Ensure a JobQueue exists
+    jq = application.job_queue
+    if jq is None:
+        jq = JobQueue()
+        jq.set_application(application)
+        jq.start()
+        application.job_queue = jq
+
     # Clear old jobs for this user
-    for j in application.job_queue.get_jobs_by_name(f"rem-{telegram_id}"):
+    for j in jq.get_jobs_by_name(f"rem-{telegram_id}"):
         j.schedule_removal()
 
     t = dtime(hour=hour, minute=minute, tzinfo=LOCAL_TZ) if LOCAL_TZ else dtime(hour=hour, minute=minute)
+
     for wd in days:
-        application.job_queue.run_daily(
+        jq.run_daily(
             personal_reminder_job,
             time=t,
             days=(wd,),
             name=f"rem-{telegram_id}",
             chat_id=telegram_id,
         )
+
 
 def restore_all_user_reminders(application: Application):
     conn = db(); c = conn.cursor()
@@ -583,6 +595,8 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+
+
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("timezone", timezone_cmd))
@@ -598,6 +612,14 @@ def main():
     app.add_handler(CommandHandler("myreminders", myreminders))
     app.add_handler(CommandHandler("stopreminders", stopreminders))
     app.add_handler(CallbackQueryHandler(cb_day, pattern=r"^day:\d$"))
+
+    # Ensure JobQueue exists (needed in webhook mode on Render)
+    if app.job_queue is None:
+        jq = JobQueue()
+        jq.set_application(app)
+        jq.start()
+        app.job_queue = jq
+
 
     restore_all_user_reminders(app)
 
