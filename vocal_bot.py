@@ -3,6 +3,7 @@ import os
 import sqlite3
 import datetime
 import logging
+import math
 from typing import Dict, List, Tuple, Optional
 
 from dotenv import load_dotenv
@@ -35,6 +36,11 @@ TEAM = ["Isayas", "Sahara", "Zufan", "Mike", "Sami", "Barok", "Betty", "Ruth"]
 
 # Minutes per session (override with env if desired)
 DEFAULT_MINUTES = int(os.getenv("DEFAULT_MINUTES", "20"))
+
+
+# ...
+VIDEOS_PER_PAGE = int(os.getenv("VIDEOS_PER_PAGE", "8"))  # change 8 → 10/12 if you like
+
 
 # Timezone (Pacific)
 try:
@@ -253,6 +259,52 @@ def kb_days() -> InlineKeyboardMarkup:
         InlineKeyboardButton("Day 2 ✅", callback_data="day:2"),
         InlineKeyboardButton("Day 3 ✅", callback_data="day:3"),
     ]])
+
+def _compact_filter_token(q: str) -> str:
+    """Pack a short, callback-safe token from the filter (<= ~40 chars)."""
+    token = q.lower().strip().replace(" ", "+")
+    token = "".join(ch for ch in token if ch.isalnum() or ch in "+-_")
+    return token[:40]
+
+def _expand_filter_token(t: str) -> str:
+    return (t or "").replace("+", " ").strip()
+
+def _filter_videos_by_query(all_vids: List[Dict], q: str) -> List[Dict]:
+    q = (q or "").lower().strip()
+    if not q:
+        return all_vids
+    return [
+        v for v in all_vids
+        if q in v["title"].lower() or any(q in t.lower() for t in v["tags"])
+    ]
+
+def _build_videos_page(vids: List[Dict], page: int, q_token: str) -> Tuple[str, InlineKeyboardMarkup]:
+    total = len(vids)
+    pages = max(1, math.ceil(total / VIDEOS_PER_PAGE))
+    page = max(0, min(page, pages - 1))
+    start, end = page * VIDEOS_PER_PAGE, min(total, (page + 1) * VIDEOS_PER_PAGE)
+
+    rows: List[List[InlineKeyboardButton]] = []
+    for v in vids[start:end]:
+        label = v["title"]
+        if v.get("duration"):
+            label = f"{label} ({v['duration']})"
+        rows.append([InlineKeyboardButton(text=f"▶️ {label}", url=v["url"])])
+
+    # nav buttons
+    nav: List[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("« Prev", callback_data=f"vidpg:{page-1}:{q_token}"))
+    if page < pages - 1:
+        nav.append(InlineKeyboardButton("Next »", callback_data=f"vidpg:{page+1}:{q_token}"))
+    if nav:
+        rows.append(nav)
+
+    # header text
+    info = f"Total: {total} • Page {page+1}/{pages}"
+    return info, InlineKeyboardMarkup(rows)
+
+
 
 def parse_days_csv(s: str) -> List[int]:
     out: List[int] = []
@@ -736,33 +788,54 @@ async def videos_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     ensure_videos_header()
-    vids = load_videos()
+    all_vids = load_videos()
 
-    q = " ".join(context.args).strip().lower() if context.args else ""
-    if q:
-        vids = [
-            v for v in vids
-            if q in v["title"].lower() or any(q in t.lower() for t in v["tags"])
-        ]
+    q = " ".join(context.args).strip() if context.args else ""
+    vids = _filter_videos_by_query(all_vids, q)
 
     if not vids:
         await update.message.reply_text("No videos found. Try a different filter or ask your leader to add some.")
         return
 
-    kb_rows = []
-    for v in vids[:12]:
-        label = v["title"]
-        if v.get("duration"):
-            label = f"{label} ({v['duration']})"
-        kb_rows.append([InlineKeyboardButton(text=f"▶️ {label}", url=v["url"])])
-
+    q_token = _compact_filter_token(q)
+    info, kb = _build_videos_page(vids, page=0, q_token=q_token)
     heading = "🎵 Practice Videos" if not q else f"🎵 Practice Videos (filter: {q})"
     await update.message.reply_text(
-        heading + "\nTip: try `/videos warmup` or `/videos breath`",
+        f"{heading}\n{info}\nTip: try `/videos warmup` or `/videos breath`",
         parse_mode=ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup(kb_rows),
+        reply_markup=kb,
         disable_web_page_preview=False
     )
+
+async def videos_page_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    try:
+        _, page_str, token = (q.data.split(":", 2) + ["", ""])[:3]
+        page = int(page_str)
+    except Exception:
+        await q.answer()
+        return
+
+    # Re-load & re-filter each time (stateless & safe)
+    all_vids = load_videos()
+    q_text = _expand_filter_token(token)
+    vids = _filter_videos_by_query(all_vids, q_text)
+
+    if not vids:
+        await q.edit_message_text("No videos found.")
+        await q.answer()
+        return
+
+    info, kb = _build_videos_page(vids, page=page, q_token=token)
+    heading = "🎵 Practice Videos" if not q_text else f"🎵 Practice Videos (filter: {q_text})"
+    await q.edit_message_text(
+        f"{heading}\n{info}\nTip: try `/videos warmup` or `/videos breath`",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=kb,
+        disable_web_page_preview=False
+    )
+    await q.answer()
+
 
 async def addvideo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -883,6 +956,7 @@ def main():
     app.add_handler(CommandHandler("videos", videos_cmd))
     app.add_handler(CommandHandler("addvideo", addvideo))
     app.add_handler(CommandHandler("delvideo", delvideo))
+    app.add_handler(CallbackQueryHandler(videos_page_cb, pattern=r"^vidpg:"))
 
     # Restore scheduled reminders from DB
     restore_all_user_reminders(app)
