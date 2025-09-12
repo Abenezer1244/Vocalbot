@@ -4,8 +4,6 @@ import sqlite3
 import datetime
 import logging
 from typing import Dict, List, Tuple, Optional
-from telegram.ext import JobQueue
-
 
 from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -15,13 +13,8 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
+    JobQueue,
 )
-
-
-def on_render_web_service() -> bool:
-    # Web Services have PORT and RENDER_EXTERNAL_URL at runtime
-    return bool(os.getenv("PORT") and os.getenv("RENDER_EXTERNAL_URL"))
-
 
 # ---------------- Logging ----------------
 logging.basicConfig(
@@ -52,14 +45,29 @@ except Exception:
     LOCAL_TZ = None
     TZ_LABEL = "Pacific"
 
-# Database path
-# Local Windows default (your OneDrive path) — Render should override with DB_PATH
+# ----- Admins (comma-separated Telegram user IDs in ENV ADMIN_IDS) -----
+ADMIN_IDS = {
+    int(x.strip())
+    for x in (os.getenv("ADMIN_IDS", "").replace(";", ",").split(","))
+    if x.strip().isdigit()
+}
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+# Quiet group mode: send /checkin buttons via DM, keep group tidy
+GROUP_QUIET_MODE = True
+
+# Local Windows default (adjust if you want); Render should override with DB_PATH
 DB_DIR_LOCAL = r"C:\Users\Windows\OneDrive - Seattle Colleges\Desktop\Vocalbot"
 os.makedirs(DB_DIR_LOCAL, exist_ok=True)
 DB_PATH = os.getenv("DB_PATH", os.path.join(DB_DIR_LOCAL, "progress.db"))
 
 # Ensure DB directory exists (works on Render and local)
 os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+
+# Detect Render Web Service (webhook path)
+def on_render_web_service() -> bool:
+    return bool(os.getenv("PORT") and (os.getenv("RENDER_EXTERNAL_URL") or os.getenv("WEBHOOK_BASE")))
 
 # ---------------- Optional Google Sheets ----------------
 SHEETS_ID = os.getenv("SHEETS_ID", "").strip()
@@ -116,10 +124,40 @@ def _get_records(ws) -> List[Dict]:
 WS_CHECKINS = None
 WS_USERS = None
 WS_REMINDERS = None
+WS_VIDEOS = None
 if GS_ENABLED:
     WS_CHECKINS = _get_ws("Checkins")    # [team_name, "Day N", minutes, ts_iso, week_start_iso, telegram_id]
     WS_USERS = _get_ws("Users")          # [telegram_id, team_name]
     WS_REMINDERS = _get_ws("Reminders")  # [telegram_id, days_csv, hour, minute]
+    WS_VIDEOS = _get_ws("Videos")        # [title, url, tags, duration]
+
+def ensure_videos_header():
+    if not GS_ENABLED or not WS_VIDEOS:
+        return
+    try:
+        vals = WS_VIDEOS.get_all_values()
+        if not vals:
+            WS_VIDEOS.update("A1:D1", [["title","url","tags","duration"]])
+    except Exception:
+        pass
+
+def load_videos() -> List[Dict]:
+    if not GS_ENABLED or not WS_VIDEOS:
+        return []
+    try:
+        rows = _get_records(WS_VIDEOS)
+        out = []
+        for r in rows:
+            title = str(r.get("title","")).strip()
+            url = str(r.get("url","")).strip()
+            tags_raw = str(r.get("tags","")).strip()
+            duration = str(r.get("duration","")).strip()
+            if title and url:
+                tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+                out.append({"title": title, "url": url, "tags": tags, "duration": duration})
+        return out
+    except Exception:
+        return []
 
 def log_to_sheet(team_name: str, day: int, minutes: int, ts_iso: str, week_start_iso: str, telegram_id: int):
     if not GS_ENABLED:
@@ -128,7 +166,6 @@ def log_to_sheet(team_name: str, day: int, minutes: int, ts_iso: str, week_start
 
 # ---------------- Database ----------------
 def db():
-    # ensure directory exists
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute("PRAGMA foreign_keys = ON")
@@ -215,7 +252,7 @@ def parse_week_rows() -> Dict[str, Dict[int, str]]:
     conn.close()
     return status
 
-# ---------------- Hydration from Sheets (so no disk is required) ----------------
+# ---------------- Hydration from Sheets ----------------
 def hydrate_from_sheets():
     if not GS_ENABLED:
         return
@@ -281,6 +318,10 @@ async def help_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "/myreminders — Show your reminder schedule\n"
         "/stopreminders — Turn off your reminders\n"
         "/timezone — Show reminder timezone\n"
+        "/videos [filter] — Browse practice videos (e.g., /videos warmup)\n"
+        "/addvideo <title> | <url> | [tags] | [duration]  (admin)\n"
+        "/delvideo <url>  or  /delvideo --all <url>      (admin)\n"
+        "/whoami — Show your Telegram ID\n"
         "(All reminder times are interpreted in Pacific Time.)"
     )
 
@@ -294,6 +335,10 @@ async def start(update: Update, _: ContextTypes.DEFAULT_TYPE):
 
 async def timezone_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"The bot’s reminder timezone is: {TZ_LABEL}")
+
+async def whoami(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    await update.message.reply_text(f"Your Telegram ID: {u.id}\nName: {u.full_name}")
 
 async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -321,8 +366,51 @@ async def register(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not found:
             _append_row(WS_USERS, [str(tg), name])
 
-async def checkin(update: Update, _: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Tap the day you completed (20 min):", reply_markup=kb_days())
+# --- Quiet-mode helpers for group check-ins ---
+async def _delete_after(context):
+    data = context.job.data or {}
+    chat_id = data.get("chat_id")
+    msg_id = data.get("msg_id")
+    try:
+        await context.bot.delete_message(chat_id, msg_id)
+    except Exception:
+        pass
+
+async def checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    chat = update.effective_chat
+
+    # Always try to send buttons via DM (quiet)
+    try:
+        await context.bot.send_message(
+            chat_id=user.id,
+            text="Tap the day you completed (20 min):",
+            reply_markup=kb_days(),
+            disable_notification=True,
+            allow_sending_without_reply=True,
+        )
+    except Exception:
+        await update.message.reply_text(
+            "Please DM me first with /start, then try /checkin again.",
+            disable_notification=True,
+        )
+        return
+
+    # If triggered from a group, keep it tidy
+    if chat.type in ("group", "supergroup") and GROUP_QUIET_MODE:
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        try:
+            m = await context.bot.send_message(
+                chat_id=chat.id,
+                text=f"📩 Sent a check-in to {user.first_name} via DM.",
+                disable_notification=True,
+            )
+            context.job_queue.run_once(_delete_after, when=5, data={"chat_id": chat.id, "msg_id": m.message_id})
+        except Exception:
+            pass
 
 async def cb_day(update: Update, _: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -472,14 +560,17 @@ async def personal_reminder_job(context: ContextTypes.DEFAULT_TYPE):
         text="🎶 Friendly reminder: aim for 20 minutes today. Use /checkin when you finish!"
     )
 
-def schedule_user_reminders(application: Application, telegram_id: int, days: List[int], hour: int, minute: int):
-    # Ensure a JobQueue exists
+def ensure_job_queue(application: Application) -> JobQueue:
     jq = application.job_queue
     if jq is None:
         jq = JobQueue()
         jq.set_application(application)
         jq.start()
         application.job_queue = jq
+    return jq
+
+def schedule_user_reminders(application: Application, telegram_id: int, days: List[int], hour: int, minute: int):
+    jq = ensure_job_queue(application)
 
     # Clear old jobs for this user
     for j in jq.get_jobs_by_name(f"rem-{telegram_id}"):
@@ -495,7 +586,6 @@ def schedule_user_reminders(application: Application, telegram_id: int, days: Li
             name=f"rem-{telegram_id}",
             chat_id=telegram_id,
         )
-
 
 def restore_all_user_reminders(application: Application):
     conn = db(); c = conn.cursor()
@@ -571,7 +661,8 @@ async def stopreminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     c.execute("DELETE FROM reminders WHERE telegram_id=?", (user.id,))
     conn.commit(); conn.close()
 
-    for j in context.application.job_queue.get_jobs_by_name(f"rem-{user.id}"):
+    jq = ensure_job_queue(context.application)
+    for j in jq.get_jobs_by_name(f"rem-{user.id}"):
         j.schedule_removal()
 
     # Sync to Sheets
@@ -585,23 +676,151 @@ async def stopreminders(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("🛑 Your personal reminders are turned off.")
 
+# ---------------- Videos ----------------
+async def videos_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not GS_ENABLED or not WS_VIDEOS:
+        await update.message.reply_text(
+            "🎬 Practice videos aren’t set up yet.\n"
+            "Ask your leader to enable Google Sheets & add a 'Videos' tab."
+        )
+        return
+
+    ensure_videos_header()
+    vids = load_videos()
+
+    q = " ".join(context.args).strip().lower() if context.args else ""
+    if q:
+        vids = [
+            v for v in vids
+            if q in v["title"].lower() or any(q in t.lower() for t in v["tags"])
+        ]
+
+    if not vids:
+        await update.message.reply_text("No videos found. Try a different filter or ask your leader to add some.")
+        return
+
+    kb_rows = []
+    for v in vids[:12]:
+        label = v["title"]
+        if v.get("duration"):
+            label = f"{label} ({v['duration']})"
+        kb_rows.append([InlineKeyboardButton(text=f"▶️ {label}", url=v["url"])])
+
+    heading = "🎵 Practice Videos" if not q else f"🎵 Practice Videos (filter: {q})"
+    await update.message.reply_text(
+        heading + "\nTip: try `/videos warmup` or `/videos breath`",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(kb_rows),
+        disable_web_page_preview=False
+    )
+
+async def addvideo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Sorry, admins only. Ask your leader to grant access.")
+        return
+    if not GS_ENABLED or not WS_VIDEOS:
+        await update.message.reply_text("Videos list requires Google Sheets enabled with a 'Videos' tab.")
+        return
+
+    ensure_videos_header()
+    text = update.message.text or ""
+    payload = text.partition(" ")[2].strip()
+    if not payload:
+        await update.message.reply_text(
+            "Usage:\n/addvideo <title> | <url> | [tags] | [duration]\n"
+            "Example:\n/addvideo 5-min Lip Trills | https://youtu.be/abc123 | warmup, lip | 5:12"
+        )
+        return
+
+    parts = [p.strip() for p in payload.split("|")]
+    if len(parts) < 2:
+        await update.message.reply_text("Please include at least: <title> | <url>")
+        return
+
+    title = parts[0]
+    url = parts[1]
+    tags = parts[2] if len(parts) >= 3 else ""
+    duration = parts[3] if len(parts) >= 4 else ""
+
+    if not (url.startswith("http://") or url.startswith("https://")):
+        await update.message.reply_text("URL must start with http:// or https://")
+        return
+
+    try:
+        WS_VIDEOS.append_row([title, url, tags, duration])
+        await update.message.reply_text(f"✅ Added video:\n• {title}\n• {url}\n• tags: {tags or '(none)'}\n• duration: {duration or '(n/a)'}")
+    except Exception as e:
+        await update.message.reply_text(f"Could not add video (Sheets error): {e}")
+
+async def delvideo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Sorry, admins only.")
+        return
+    if not GS_ENABLED or not WS_VIDEOS:
+        await update.message.reply_text("Videos list requires Google Sheets enabled with a 'Videos' tab.")
+        return
+
+    ensure_videos_header()
+    args = (context.args or [])
+    if not args:
+        await update.message.reply_text(
+            "Usage:\n"
+            "/delvideo <url>\n"
+            "or remove every match:\n"
+            "/delvideo --all <url>"
+        )
+        return
+
+    delete_all = False
+    if args[0] == "--all":
+        delete_all = True
+        args = args[1:]
+
+    url = " ".join(args).strip()
+    if not url:
+        await update.message.reply_text("Please provide the exact URL to delete.")
+        return
+
+    try:
+        raw = WS_VIDEOS.get_all_values()  # includes header row
+        to_delete = []
+        for idx, row in enumerate(raw[1:], start=2):  # start=2 because header is row 1
+            if len(row) >= 2 and row[1].strip() == url:
+                to_delete.append(idx)
+                if not delete_all:
+                    break
+        if not to_delete:
+            await update.message.reply_text("No row found with that URL.")
+            return
+        for r in reversed(to_delete):
+            WS_VIDEOS.delete_rows(r)
+        if delete_all and len(to_delete) > 1:
+            await update.message.reply_text(f"🗑️ Deleted {len(to_delete)} videos with that URL.")
+        else:
+            await update.message.reply_text("🗑️ Deleted 1 video.")
+    except Exception as e:
+        await update.message.reply_text(f"Could not delete (Sheets error): {e}")
+
 # ---------------- Main ----------------
 def main():
     init_db()
-
-    # If you want zero data loss without a Render disk, keep SHEETS_ID set and use
-    # DB_PATH=/tmp/progress.db — the next call rebuilds local state from Sheets:
-    hydrate_from_sheets()
+    hydrate_from_sheets()  # rebuild local state from Sheets (no disk needed)
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Ensure JobQueue exists (needed in webhook mode on Render)
+    ensure_job_queue(app)
 
-
+    # Handlers
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("timezone", timezone_cmd))
+    app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("register", register))
     app.add_handler(CommandHandler("checkin", checkin))
+    app.add_handler(CallbackQueryHandler(cb_day, pattern=r"^day:\d$"))
     app.add_handler(CommandHandler("week", week))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
     app.add_handler(CommandHandler("me", me))
@@ -611,27 +830,20 @@ def main():
     app.add_handler(CommandHandler("remind", remind))
     app.add_handler(CommandHandler("myreminders", myreminders))
     app.add_handler(CommandHandler("stopreminders", stopreminders))
-    app.add_handler(CallbackQueryHandler(cb_day, pattern=r"^day:\d$"))
+    app.add_handler(CommandHandler("videos", videos_cmd))
+    app.add_handler(CommandHandler("addvideo", addvideo))
+    app.add_handler(CommandHandler("delvideo", delvideo))
 
-    # Ensure JobQueue exists (needed in webhook mode on Render)
-    if app.job_queue is None:
-        jq = JobQueue()
-        jq.set_application(app)
-        jq.start()
-        app.job_queue = jq
-
-
+    # Restore scheduled reminders from DB
     restore_all_user_reminders(app)
 
     log.info("Bot starting...")
 
     if on_render_web_service():
-        # --- WEBHOOK MODE for Render Web Service (FREE) ---
         port = int(os.getenv("PORT", "10000"))
         base = os.getenv("WEBHOOK_BASE") or os.getenv("RENDER_EXTERNAL_URL")
         if not base:
             raise SystemExit("WEBHOOK_BASE or RENDER_EXTERNAL_URL not set")
-
         webhook_url = f"{base.rstrip('/')}/{BOT_TOKEN}"
         log.info(f"Using webhook URL: {webhook_url}")
 
@@ -644,12 +856,10 @@ def main():
             drop_pending_updates=True,
         )
     else:
-        # --- LOCAL / WORKER MODE (long-polling) ---
         app.run_polling(
             allowed_updates=["message", "callback_query", "chat_member", "my_chat_member"],
             drop_pending_updates=True,
         )
-
 
 if __name__ == "__main__":
     main()
