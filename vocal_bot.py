@@ -407,7 +407,10 @@ async def help_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "/videos [filter] — Browse practice videos (e.g., /videos warmup)\n"
         "/addvideo <title> | <url> | [tags] | [duration]  (admin)\n"
         "/delvideo <url>  or  /delvideo --all <url>      (admin)\n"
-        "/whoami — Show your Telegram ID\n"
+        "/whoami — Show your Telegram ID\n" \
+        "/roster — who is registered (names)\n"
+        "/roster_ids — registered names + IDs (admin)\n"
+        "/nocheckins — who hasn’t checked in this week\n"
         "(All reminder times are interpreted in Pacific Time.)"
     )
 
@@ -563,6 +566,59 @@ async def week(update: Update, _: ContextTypes.DEFAULT_TYPE):
         d1, d2, d3 = status[n][1], status[n][2], status[n][3]
         lines.append(f"`{n:<10} | {d1} | {d2} | {d3}`")
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+async def roster(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    """Show who is registered (names only)."""
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT team_name FROM users")
+    names = sorted([row[0] for row in c.fetchall()])
+    conn.close()
+
+    registered = set(names)
+    missing = [n for n in TEAM if n not in registered]
+
+    lines = [f"*Registered* ({len(names)}/{len(TEAM)})"]
+    lines.append(", ".join(names) if names else "_none_")
+    if missing:
+        lines += ["", "*Not yet registered*", ", ".join(missing)]
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def roster_ids(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    """Admins-only: show registered names with Telegram IDs."""
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Sorry, admins only.")
+        return
+
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT team_name, telegram_id FROM users ORDER BY team_name")
+    rows = c.fetchall()
+    conn.close()
+
+    lines = [f"*Registered IDs* ({len(rows)}/{len(TEAM)})", ""]
+    if not rows:
+        lines.append("_none_")
+    else:
+        for name, tid in rows:
+            lines.append(f"{name}: `{tid}`")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def nocheckins(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    """Who hasn't logged anything *this week*."""
+    wk = week_start_iso()
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT DISTINCT team_name FROM checkins WHERE week_start=?", (wk,))
+    done = {name for (name,) in c.fetchall()}
+    conn.close()
+
+    missing = [n for n in TEAM if n not in done]
+    if missing:
+        await update.message.reply_text("Not yet checked in this week: " + ", ".join(missing))
+    else:
+        await update.message.reply_text("Everyone has checked in this week 🎉")
+
+
 
 async def leaderboard(update: Update, _: ContextTypes.DEFAULT_TYPE):
     wk = week_start_iso()
@@ -957,6 +1013,9 @@ def main():
     app.add_handler(CommandHandler("addvideo", addvideo))
     app.add_handler(CommandHandler("delvideo", delvideo))
     app.add_handler(CallbackQueryHandler(videos_page_cb, pattern=r"^vidpg:"))
+    app.add_handler(CommandHandler("roster", roster))
+    app.add_handler(CommandHandler("roster_ids", roster_ids))
+    app.add_handler(CommandHandler("nocheckins", nocheckins))
 
     # Restore scheduled reminders from DB
     restore_all_user_reminders(app)
