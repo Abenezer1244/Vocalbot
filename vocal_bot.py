@@ -128,6 +128,7 @@ def _get_records(ws) -> List[Dict]:
         return []
 
 WS_CHECKINS = None
+WS_ARCHIVE = None
 WS_USERS = None
 WS_REMINDERS = None
 WS_VIDEOS = None
@@ -136,6 +137,30 @@ if GS_ENABLED:
     WS_USERS = _get_ws("Users")          # [telegram_id, team_name]
     WS_REMINDERS = _get_ws("Reminders")  # [telegram_id, days_csv, hour, minute]
     WS_VIDEOS = _get_ws("Videos")        # [title, url, tags, duration]
+    WS_ARCHIVE = _get_ws("CheckinsArchive")
+
+
+    # Archived Checkins (keep history even if Checkins is cleaned)
+    if GS_ENABLED and WS_ARCHIVE:
+        for r in _get_records(WS_ARCHIVE):
+            try:
+                name = str(r.get("team_name", "")).strip()
+                day_s = str(r.get("day", "")).strip().replace("Day", "").strip()
+                day = int(day_s) if day_s.isdigit() else None
+                minutes = int(str(r.get("minutes", "20")).strip() or "20")
+                ts = str(r.get("ts", "")).strip() or str(r.get("timestamp", "")).strip()
+                wk = str(r.get("week_start", "")).strip()
+                tg = int(str(r.get("telegram_id", "")).strip()) if r.get("telegram_id") else None
+                if name and day in (1, 2, 3) and wk:
+                    c.execute("""INSERT OR IGNORE INTO checkins
+                                 (telegram_id, team_name, week_start, day, minutes, ts)
+                                 VALUES (?,?,?,?,?,?)""",
+                              (tg, name, wk, day, minutes, ts or ""))
+            except Exception:
+                pass
+
+
+
 
 def ensure_videos_header():
     if not GS_ENABLED or not WS_VIDEOS:
@@ -277,6 +302,86 @@ def _filter_videos_by_query(all_vids: List[Dict], q: str) -> List[Dict]:
         v for v in all_vids
         if q in v["title"].lower() or any(q in t.lower() for t in v["tags"])
     ]
+
+def _archive_and_clear_week(week_iso: str):
+    """Copy last week's rows from Checkins -> CheckinsArchive, then clear them (and DB)."""
+    # Sheets side
+    if GS_ENABLED and WS_CHECKINS:
+        try:
+            # Ensure archive sheet exists
+            arch = WS_ARCHIVE or _get_ws("CheckinsArchive")
+            raw = WS_CHECKINS.get_all_values()  # includes header
+            rows_to_delete = []
+            payload = []
+            for idx, r in enumerate(raw[1:], start=2):
+                if len(r) >= 5 and r[4].strip() == week_iso:
+                    # r: [team_name, day, minutes, ts, week_start, telegram_id?]
+                    # Normalize length to 6 columns
+                    row = r + [""] * max(0, 6 - len(r))
+                    payload.append(row[:6])
+                    rows_to_delete.append(idx)
+            # Append to archive
+            if payload:
+                arch.append_rows(payload)
+            # Delete from bottom up to keep indices valid
+            for i in reversed(rows_to_delete):
+                WS_CHECKINS.delete_rows(i)
+        except Exception as e:
+            log.warning(f"Archive step failed: {e}")
+
+    # DB side (optional cleanup)
+    try:
+        conn = db(); c = conn.cursor()
+        c.execute("DELETE FROM checkins WHERE week_start=?", (week_iso,))
+        conn.commit(); conn.close()
+    except Exception as e:
+        log.warning(f"DB cleanup for {week_iso} failed: {e}")
+
+def _clear_week_no_archive(week_iso: str):
+    """Delete last week's rows from Checkins and DB without archiving (not recommended)."""
+    if GS_ENABLED and WS_CHECKINS:
+        try:
+            raw = WS_CHECKINS.get_all_values()
+            rows_to_delete = []
+            for idx, r in enumerate(raw[1:], start=2):
+                if len(r) >= 5 and r[4].strip() == week_iso:
+                    rows_to_delete.append(idx)
+            for i in reversed(rows_to_delete):
+                WS_CHECKINS.delete_rows(i)
+        except Exception as e:
+            log.warning(f"Sheet clear failed: {e}")
+    try:
+        conn = db(); c = conn.cursor()
+        c.execute("DELETE FROM checkins WHERE week_start=?", (week_iso,))
+        conn.commit(); conn.close()
+    except Exception as e:
+        log.warning(f"DB clear failed: {e}")
+
+
+from datetime import time as dtime
+
+def schedule_week_rollover(application: Application):
+    """Run every Monday 00:05 Pacific: archive/clear the *previous* week."""
+    def _job_selector(context: ContextTypes.DEFAULT_TYPE):
+        today = datetime.date.today()
+        this_week_start = today - datetime.timedelta(days=today.weekday())  # Monday
+        last_week_start = (this_week_start - datetime.timedelta(days=7)).isoformat()
+        if AUTO_ARCHIVE_PREV_WEEK:
+            _archive_and_clear_week(last_week_start)
+        elif AUTO_CLEAR_PREV_WEEK:
+            _clear_week_no_archive(last_week_start)
+        else:
+            # neither enabled: do nothing
+            pass
+
+    jq = ensure_job_queue(application)
+    jq.run_daily(
+        _job_selector,
+        time=dtime(hour=0, minute=5, tzinfo=LOCAL_TZ),  # 00:05 Pacific, cushion for midnight transitions
+        days=(0,),  # Monday
+        name="weekly-rollover",
+    )
+
 
 def _build_videos_page(vids: List[Dict], page: int, q_token: str) -> Tuple[str, InlineKeyboardMarkup]:
     total = len(vids)
@@ -991,6 +1096,10 @@ def main():
 
     # Ensure JobQueue exists (needed in webhook mode on Render)
     ensure_job_queue(app)
+
+    # Schedule weekly rollover (archive+clear or clear-only)
+    schedule_week_rollover(app)
+
 
     # Handlers
     app.add_handler(CommandHandler("help", help_cmd))
