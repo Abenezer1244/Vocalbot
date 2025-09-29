@@ -4,6 +4,11 @@ import sqlite3
 import datetime
 import logging
 import math
+import random
+import asyncio
+
+
+
 from typing import Dict, List, Tuple, Optional
 
 from dotenv import load_dotenv
@@ -96,6 +101,50 @@ if SHEETS_ID:
     except Exception as e:
         log.warning("Google Sheets not available/failed to init: %s", e)
         GS_ENABLED = False
+
+
+
+GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID", "0") or "0")
+
+# Group broadcast texts
+MONDAY_9AM_MSG = (
+    "🌅 *Happy Monday, team!* Let’s kick off the week strong.\n"
+    "Aim for your first 20-min practice today. If you’re joining *tonight at 7:00 PM PT*, "
+    "warm up with /videos and log it with /checkin ✅"
+)
+
+SATURDAY_9AM_MSG = (
+    "🎯 *Saturday focus!* Set aside *5:00 PM PT* for a solid 20-min practice.\n"
+    "Finish strong and grab that 3/3!  /checkin  |  /videos"
+)
+
+# Public-domain (KJV) verses focused on singing, praise, and encouragement
+BIBLE_VERSES = [
+    ("Psalm 96:1", "O sing unto the LORD a new song: sing unto the LORD, all the earth."),
+    ("Psalm 95:1", "O come, let us sing unto the LORD: let us make a joyful noise to the rock of our salvation."),
+    ("Psalm 33:3", "Sing unto him a new song; play skilfully with a loud noise."),
+    ("Psalm 13:6", "I will sing unto the LORD, because he hath dealt bountifully with me."),
+    ("Psalm 108:1", "O God, my heart is fixed; I will sing and give praise, even with my glory."),
+    ("Psalm 57:7", "My heart is fixed, O God, my heart is fixed: I will sing and give praise."),
+    ("Psalm 47:6", "Sing praises to God, sing praises: sing praises unto our King, sing praises."),
+    ("Psalm 28:7", "The LORD is my strength and my shield; my heart trusted in him... and with my song will I praise him."),
+    ("Psalm 42:8", "In the night his song shall be with me, and my prayer unto the God of my life."),
+    ("Psalm 149:1", "Praise ye the LORD. Sing unto the LORD a new song, and his praise in the congregation of saints."),
+    ("Psalm 100:1–2", "Make a joyful noise unto the LORD... Serve the LORD with gladness: come before his presence with singing."),
+    ("1 Chr 16:23", "Sing unto the LORD, all the earth; shew forth from day to day his salvation."),
+    ("Isaiah 40:31", "They that wait upon the LORD shall renew their strength; they shall mount up with wings as eagles."),
+    ("Zephaniah 3:17", "The LORD thy God in the midst of thee is mighty; he will rejoice over thee with singing."),
+    ("Ephesians 5:19", "Speaking to yourselves in psalms and hymns and spiritual songs, singing and making melody in your heart to the Lord."),
+    ("Colossians 3:16", "Let the word of Christ dwell in you richly... singing with grace in your hearts to the Lord."),
+    ("Philippians 4:13", "I can do all things through Christ which strengtheneth me."),
+    ("Hebrews 13:15", "Let us offer the sacrifice of praise to God continually, that is, the fruit of our lips giving thanks to his name."),
+    ("James 5:13", "Is any merry? let him sing psalms."),
+    ("Psalm 118:24", "This is the day which the LORD hath made; we will rejoice and be glad in it."),
+]
+
+
+
+
 
 # --- Sheets helpers & worksheets (created on demand) ---
 def _open_sheet():
@@ -497,6 +546,92 @@ async def chatid(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Chat ID: {update.effective_chat.id}")
 
 
+
+async def _send_group_text(context: ContextTypes.DEFAULT_TYPE):
+    text = context.job.data.get("text", "")
+    if GROUP_CHAT_ID:
+        try:
+            await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=text, parse_mode=ParseMode.MARKDOWN, disable_web_page_preview=True)
+        except Exception:
+            pass
+
+async def _send_bible_verse(context: ContextTypes.DEFAULT_TYPE):
+    if not GROUP_CHAT_ID or not BIBLE_VERSES:
+        return
+    # Pick by ISO week number so it rotates predictably week to week
+    try:
+        wk = datetime.date.today().isocalendar()[1]  # 1..53
+    except Exception:
+        wk = int(datetime.date.today().strftime("%U"))  # fallback
+    ref, verse = BIBLE_VERSES[wk % len(BIBLE_VERSES)]
+    text = f"📖 *Weekly encouragement*\n_{ref}_\n“{verse}”"
+    try:
+        await context.bot.send_message(
+            chat_id=GROUP_CHAT_ID,
+            text=text,
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception:
+        pass
+
+
+def schedule_group_broadcasts(application: Application):
+    jq = ensure_job_queue(application)
+    if not GROUP_CHAT_ID:
+        log.warning("GROUP_CHAT_ID not set; group broadcasts disabled.")
+        return
+
+    # Monday 09:00 PT (heads-up for 7pm)
+    jq.run_daily(
+        _send_group_text,
+        time=dtime(hour=9, minute=0, tzinfo=LOCAL_TZ),
+        days=(0,),  # Monday
+        name="grp-mon-9am",
+        data={"text": MONDAY_9AM_MSG},
+    )
+
+    # Saturday 09:00 PT (heads-up for 5pm)
+    jq.run_daily(
+        _send_group_text,
+        time=dtime(hour=9, minute=0, tzinfo=LOCAL_TZ),
+        days=(5,),  # Saturday
+        name="grp-sat-9am",
+        data={"text": SATURDAY_9AM_MSG},
+    )
+
+    # Weekly Bible verse — Sunday 07:30 PT
+    jq.run_daily(
+        _send_bible_verse,
+        time=dtime(hour=7, minute=30, tzinfo=LOCAL_TZ),
+        days=(6,),  # Sunday
+        name="grp-sun-verse",
+    )
+
+
+async def _dm_nudge(context: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "👋 *Quick practice nudge*: Aim for a 20-minute session today or tomorrow.\n"
+        "Log it with /checkin and browse ideas with /videos. You’ve got this! 🎶"
+    )
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT telegram_id, team_name FROM users")
+    rows = c.fetchall(); conn.close()
+    for uid, _name in rows:
+        try:
+            await context.bot.send_message(chat_id=uid, text=msg, parse_mode=ParseMode.MARKDOWN)
+            await asyncio.sleep(0.05)  # be gentle with rate limits
+        except Exception:
+            # user may not have /start'd the bot yet
+            pass
+
+def schedule_individual_nudges(application: Application):
+    jq = ensure_job_queue(application)
+    # Tue & Thu at 10:00 PT (adjust if you prefer)
+    jq.run_daily(_dm_nudge, time=dtime(hour=10, minute=0, tzinfo=LOCAL_TZ), days=(1,), name="dm-tue")
+    jq.run_daily(_dm_nudge, time=dtime(hour=10, minute=0, tzinfo=LOCAL_TZ), days=(3,), name="dm-thu")
+
+
+
 # ---------------- Handlers ----------------
 async def help_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -610,7 +745,7 @@ async def checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-async def cb_day(update: Update, _: ContextTypes.DEFAULT_TYPE):
+async def cb_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     day = int(q.data.split(":")[1])
@@ -626,18 +761,29 @@ async def cb_day(update: Update, _: ContextTypes.DEFAULT_TYPE):
     team_name = row[0]
     wk = week_start_iso()
 
-    # Current timestamp & local Pacific date
+    # Timestamp & Pacific local date
     now = datetime.datetime.now(tz=LOCAL_TZ) if LOCAL_TZ else datetime.datetime.now()
     ts = now.isoformat(timespec="seconds")
     local_date = now.date().isoformat()
 
-    # NEW: block multiple check-ins on the same calendar day
+    # Block more than one check-in in the same calendar day
     c.execute("SELECT 1 FROM checkins WHERE telegram_id=? AND local_date=?", (user.id, local_date))
     if c.fetchone():
         conn.close()
         await q.edit_message_text(
-            f"You’ve already checked in today ({local_date}). "
-            f"Please come back tomorrow to log Day {day}."
+            f"You’ve already checked in today ({local_date}). Please come back tomorrow."
+        )
+        return
+
+    # Enforce consecutive order within the week (Day 1 -> Day 2 -> Day 3)
+    c.execute("SELECT DISTINCT day FROM checkins WHERE telegram_id=? AND week_start=?", (user.id, wk))
+    done_days = sorted([d for (d,) in c.fetchall()])
+    next_needed = (max(done_days) + 1) if done_days else 1
+    if day != next_needed:
+        conn.close()
+        await q.edit_message_text(
+            f"Let’s go in order this week. Next up is *Day {next_needed}*.",
+            parse_mode=ParseMode.MARKDOWN,
         )
         return
 
@@ -651,12 +797,21 @@ async def cb_day(update: Update, _: ContextTypes.DEFAULT_TYPE):
         msg = f"Logged {team_name}: Day {day} ✅ ({DEFAULT_MINUTES} min)"
         log_to_sheet(team_name, day, DEFAULT_MINUTES, ts, wk, user.id)
     except sqlite3.IntegrityError:
-        # This still covers the per-week 'same Day twice' case
         msg = f"{team_name}: Day {day} already logged this week."
-    finally:
-        conn.close()
+    # Celebrate if this makes 3/3
+    c.execute("SELECT COUNT(DISTINCT day) FROM checkins WHERE telegram_id=? AND week_start=?", (user.id, wk))
+    cnt = c.fetchone()[0]
+    conn.close()
 
     await q.edit_message_text(msg)
+
+    if cnt == 3 and GROUP_CHAT_ID:
+        try:
+            party = random.choice(["🎉", "🙌", "✨", "🎊", "🔥"])
+            text = f"{party} *{team_name}* just completed all 3 practices this week! Give them some love in the chat! {party}"
+            await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=text, parse_mode=ParseMode.MARKDOWN)
+        except Exception:
+            pass
 
 
 
@@ -1100,6 +1255,10 @@ def main():
 
     # Ensure JobQueue exists (needed in webhook mode on Render)
     ensure_job_queue(app)
+
+    # Broadcasts & nudges
+    schedule_group_broadcasts(app)
+    schedule_individual_nudges(app)
 
     # Schedule weekly rollover (archive+clear or clear-only)
     schedule_week_rollover(app)
