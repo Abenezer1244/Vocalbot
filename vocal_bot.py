@@ -325,66 +325,87 @@ def db():
 def init_db():
     conn = db()
     c = conn.cursor()
+
+    # --- create tables (include local_date from the start) ---
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS users(
+      telegram_id INTEGER PRIMARY KEY,
+      team_name   TEXT NOT NULL
+    )""")
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS checkins(
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      telegram_id INTEGER,
+      team_name   TEXT NOT NULL,
+      week_start  TEXT NOT NULL,
+      day         INTEGER NOT NULL CHECK(day IN (1,2,3)),
+      minutes     INTEGER NOT NULL,
+      ts          TEXT NOT NULL,
+      local_date  TEXT,
+      UNIQUE(telegram_id, week_start, day)
+    )""")
+
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS reminders(
+      telegram_id INTEGER PRIMARY KEY,
+      days_csv    TEXT NOT NULL,
+      hour        INTEGER NOT NULL,
+      minute      INTEGER NOT NULL
+    )""")
+
+    # XP/Badges/Programs (if you added these features)
     c.execute("""
     CREATE TABLE IF NOT EXISTS xp(
       telegram_id INTEGER PRIMARY KEY,
-      team_name TEXT NOT NULL,
-      xp INTEGER NOT NULL DEFAULT 0,
-      level INTEGER NOT NULL DEFAULT 1,
-      last_badge TEXT
+      team_name   TEXT NOT NULL,
+      xp          INTEGER NOT NULL DEFAULT 0,
+      level       INTEGER NOT NULL DEFAULT 1,
+      last_badge  TEXT
     )""")
+
     c.execute("""
     CREATE TABLE IF NOT EXISTS badges(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
       telegram_id INTEGER NOT NULL,
-      team_name TEXT NOT NULL,
-      badge_code TEXT NOT NULL,
+      team_name   TEXT NOT NULL,
+      badge_code  TEXT NOT NULL,
       badge_title TEXT NOT NULL,
-      awarded_ts TEXT NOT NULL,
-      week_start TEXT
+      awarded_ts  TEXT NOT NULL,
+      week_start  TEXT
     )""")
+
     c.execute("""
     CREATE TABLE IF NOT EXISTS program_enrollments(
       telegram_id INTEGER PRIMARY KEY,
-      program TEXT NOT NULL,
-      step_index INTEGER NOT NULL
+      program     TEXT NOT NULL,
+      step_index  INTEGER NOT NULL
     )""")
 
     conn.commit()
 
-    # Ensure 'local_date' column exists (older DBs might not have it)
-    cols = {row[1] for row in c.execute("PRAGMA table_info(checkins)").fetchall()}
+    # --- migrations for older DBs (only if needed) ---
+    try:
+        cols = [row[1] for row in c.execute("PRAGMA table_info(checkins)").fetchall()]
+    except sqlite3.OperationalError:
+        cols = []
+
     if "local_date" not in cols:
-        c.execute("ALTER TABLE checkins ADD COLUMN local_date TEXT")
-        conn.commit()
-
-    # Backfill local_date where missing, using Pacific time if available
-    rows = c.execute("SELECT id, ts FROM checkins WHERE local_date IS NULL OR local_date=''").fetchall()
-    for cid, ts in rows:
-        local_date = None
         try:
-            dt = datetime.datetime.fromisoformat(ts)
-            if LOCAL_TZ:
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=LOCAL_TZ)
-                else:
-                    dt = dt.astimezone(LOCAL_TZ)
-            local_date = dt.date().isoformat()
-        except Exception:
-            # fallback: best-effort date parse
-            local_date = ts.split("T")[0] if "T" in ts else ts[:10]
-        c.execute("UPDATE checkins SET local_date=? WHERE id=?", (local_date, cid))
-    conn.commit()
+            c.execute("ALTER TABLE checkins ADD COLUMN local_date TEXT")
+        except sqlite3.OperationalError as e:
+            # If another instance already added it, or table missing in a race, just continue
+            log.warning("Skipping local_date migration: %s", e)
 
-    # Create a UNIQUE daily index so a user can log at most once per calendar day
+    # Unique index to block two check-ins in one calendar day
     try:
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_checkins_daily ON checkins(telegram_id, local_date)")
-        conn.commit()
-    except Exception as e:
-        # If historic duplicates exist, index creation can fail; the code-level guard still prevents new ones.
-        log.warning("Could not create daily unique index (existing duplicates?). Guard will be enforced in code. %s", e)
+    except sqlite3.OperationalError as e:
+        log.warning("Could not create ux_checkins_daily (maybe duplicates exist): %s", e)
 
+    conn.commit()
     conn.close()
+
 
 # ---------------- Helpers ----------------
 WEEKDAY_MAP: Dict[str, int] = {"MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4, "SAT": 5, "SUN": 6}
