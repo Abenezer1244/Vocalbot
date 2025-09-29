@@ -493,6 +493,10 @@ def hydrate_from_sheets():
     conn.commit(); conn.close()
     log.info("Hydrated local state from Google Sheets.")
 
+async def chatid(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Chat ID: {update.effective_chat.id}")
+
+
 # ---------------- Handlers ----------------
 async def help_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -1102,6 +1106,8 @@ def main():
 
 
     # Handlers
+    app.add_handler(CommandHandler("chatid", chatid))
+
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("timezone", timezone_cmd))
