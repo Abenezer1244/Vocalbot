@@ -9,6 +9,7 @@ import asyncio
 
 
 
+from tokenize import Name
 from typing import Dict, List, Tuple, Optional
 
 from dotenv import load_dotenv
@@ -28,6 +29,47 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger("vocal-bot")
+
+
+# ----- XP / Levels -----
+XP_PER_CHECKIN = int(os.getenv("XP_PER_CHECKIN", "10"))
+XP_BONUS_FULL_WEEK = int(os.getenv("XP_BONUS_FULL_WEEK", "30"))
+XP_BONUS_STREAK_4 = int(os.getenv("XP_BONUS_STREAK_4", "40"))  # bonus when hitting 4-week full streak
+
+# Simple level curve: total XP thresholds for levels
+LEVEL_THRESHOLDS = [0, 50, 120, 210, 320, 450, 600, 800, 1050]  # L1..L9
+
+def level_for_xp(xp: int) -> int:
+    lvl = 1
+    for i, th in enumerate(LEVEL_THRESHOLDS, start=1):
+        if xp >= th:
+            lvl = i
+    return lvl
+
+def next_threshold(xp: int) -> int:
+    for th in LEVEL_THRESHOLDS:
+        if xp < th:
+            return th
+    return LEVEL_THRESHOLDS[-1]
+
+def xp_progress_bar(xp: int, width: int = 12) -> str:
+    cur_lvl = level_for_xp(xp)
+    prev_th = 0 if cur_lvl <= 1 else LEVEL_THRESHOLDS[cur_lvl - 1 - 0]
+    nxt_th = next_threshold(xp)
+    span = max(1, nxt_th - prev_th)
+    filled = int((xp - prev_th) / span * width)
+    return "█" * filled + "░" * (width - filled)
+
+# ----- Badges (codes + titles) -----
+BADGE_TITLES = {
+    "FIRST_FULL_WEEK": "First 3/3 ✅",
+    "FOUR_WEEK_STREAK": "4-Week Streak 🔥",
+    "EARLY_BIRD": "Early Bird (Monday start) 🌅",
+    "COMEBACK": "Comeback (back after a zero week) 💪",
+}
+
+
+
 
 # ---------------- Env & Config ----------------
 load_dotenv()
@@ -181,13 +223,20 @@ WS_ARCHIVE = None
 WS_USERS = None
 WS_REMINDERS = None
 WS_VIDEOS = None
+WS_XP = None
+WS_BADGES = None
+WS_PROGRAMS = None
+WS_PROG_ENROLL = None
 if GS_ENABLED:
     WS_CHECKINS = _get_ws("Checkins")    # [team_name, "Day N", minutes, ts_iso, week_start_iso, telegram_id]
     WS_USERS = _get_ws("Users")          # [telegram_id, team_name]
     WS_REMINDERS = _get_ws("Reminders")  # [telegram_id, days_csv, hour, minute]
     WS_VIDEOS = _get_ws("Videos")        # [title, url, tags, duration]
     WS_ARCHIVE = _get_ws("CheckinsArchive")
-
+    WS_XP = _get_ws("XP")
+    WS_BADGES = _get_ws("Badges")
+    WS_PROGRAMS = _get_ws("Programs")
+    WS_PROG_ENROLL = _get_ws("ProgramEnrollments")
 
     # Archived Checkins (keep history even if Checkins is cleaned)
     if GS_ENABLED and WS_ARCHIVE:
@@ -209,6 +258,28 @@ if GS_ENABLED:
                 pass
 
 
+
+def ensure_xp_header():
+    if GS_ENABLED and WS_XP:
+        vals = WS_XP.get_all_values()
+        if not vals:
+            WS_XP.update("A1:E1", [["telegram_id","team_name","xp","level","last_badge"]])
+
+def ensure_badges_header():
+    if GS_ENABLED and WS_BADGES:
+        vals = WS_BADGES.get_all_values()
+        if not vals:
+            WS_BADGES.update("A1:F1", [["telegram_id","team_name","badge_code","badge_title","awarded_ts","week_start"]])
+
+def ensure_program_headers():
+    if GS_ENABLED and WS_PROGRAMS:
+        vals = WS_PROGRAMS.get_all_values()
+        if not vals:
+            WS_PROGRAMS.update("A1:F1", [["program","step","title","url","tags","duration"]])
+    if GS_ENABLED and WS_PROG_ENROLL:
+        vals2 = WS_PROG_ENROLL.get_all_values()
+        if not vals2:
+            WS_PROG_ENROLL.update("A1:C1", [["telegram_id","program","step_index"]])
 
 
 def ensure_videos_header():
@@ -255,29 +326,30 @@ def init_db():
     conn = db()
     c = conn.cursor()
     c.execute("""
-    CREATE TABLE IF NOT EXISTS users(
+    CREATE TABLE IF NOT EXISTS xp(
       telegram_id INTEGER PRIMARY KEY,
-      team_name TEXT NOT NULL
-    )""")
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS checkins(
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      telegram_id INTEGER,
       team_name TEXT NOT NULL,
-      week_start TEXT NOT NULL,
-      day INTEGER NOT NULL CHECK(day IN (1,2,3)),
-      minutes INTEGER NOT NULL,
-      ts TEXT NOT NULL,
-      local_date TEXT
-      -- NOTE: uniqueness is enforced via index created below
+      xp INTEGER NOT NULL DEFAULT 0,
+      level INTEGER NOT NULL DEFAULT 1,
+      last_badge TEXT
     )""")
     c.execute("""
-    CREATE TABLE IF NOT EXISTS reminders(
-      telegram_id INTEGER PRIMARY KEY,
-      days_csv TEXT NOT NULL,
-      hour INTEGER NOT NULL,
-      minute INTEGER NOT NULL
+    CREATE TABLE IF NOT EXISTS badges(
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      telegram_id INTEGER NOT NULL,
+      team_name TEXT NOT NULL,
+      badge_code TEXT NOT NULL,
+      badge_title TEXT NOT NULL,
+      awarded_ts TEXT NOT NULL,
+      week_start TEXT
     )""")
+    c.execute("""
+    CREATE TABLE IF NOT EXISTS program_enrollments(
+      telegram_id INTEGER PRIMARY KEY,
+      program TEXT NOT NULL,
+      step_index INTEGER NOT NULL
+    )""")
+
     conn.commit()
 
     # Ensure 'local_date' column exists (older DBs might not have it)
@@ -385,6 +457,196 @@ def _archive_and_clear_week(week_iso: str):
         conn.commit(); conn.close()
     except Exception as e:
         log.warning(f"DB cleanup for {week_iso} failed: {e}")
+
+
+def get_or_create_xp(telegram_id: int, team_name: str) -> Tuple[int,int,str]:
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT xp, level, last_badge FROM xp WHERE telegram_id=?", (telegram_id,))
+    row = c.fetchone()
+    if not row:
+        c.execute("INSERT INTO xp(telegram_id,team_name,xp,level,last_badge) VALUES (?,?,?,?,?)",
+                  (telegram_id, team_name, 0, 1, None))
+        conn.commit()
+        xp, lvl, lb = 0, 1, None
+    else:
+        xp, lvl, lb = row
+    conn.close()
+    return xp, lvl, lb
+
+def set_xp(telegram_id: int, team_name: str, xp: int, level: int, last_badge: Optional[str]):
+    conn = db(); c = conn.cursor()
+    c.execute("""REPLACE INTO xp(telegram_id,team_name,xp,level,last_badge)
+                 VALUES (?,?,?,?,?)""", (telegram_id, team_name, xp, level, last_badge))
+    conn.commit(); conn.close()
+    # mirror to Sheets
+    if GS_ENABLED and WS_XP:
+        ensure_xp_header()
+        rows = _get_records(WS_XP)
+        found = False
+        for idx, r in enumerate(rows, start=2):
+            if str(r.get("telegram_id","")).strip() == str(telegram_id):
+                WS_XP.update(f"A{idx}:E{idx}", [[str(telegram_id), team_name, xp, level, last_badge or ""]])
+                found = True; break
+        if not found:
+            WS_XP.append_row([str(telegram_id), team_name, xp, level, last_badge or ""])
+
+def award_badge(telegram_id: int, team_name: str, code: str, wk: Optional[str] = None) -> bool:
+    """Return True if newly awarded (i.e., not duplicate)."""
+    title = BADGE_TITLES.get(code, code)
+    ts = datetime.datetime.now(tz=LOCAL_TZ).isoformat(timespec="seconds") if LOCAL_TZ else datetime.datetime.now().isoformat(timespec="seconds")
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT 1 FROM badges WHERE telegram_id=? AND badge_code=?", (telegram_id, code))
+    if c.fetchone():
+        conn.close()
+        return False
+    c.execute("""INSERT INTO badges(telegram_id,team_name,badge_code,badge_title,awarded_ts,week_start)
+                 VALUES (?,?,?,?,?,?)""",(telegram_id, team_name, code, title, ts, wk))
+    conn.commit(); conn.close()
+    # mirror
+    if GS_ENABLED and WS_BADGES:
+        ensure_badges_header()
+        WS_BADGES.append_row([str(telegram_id), team_name, code, title, ts, wk or ""])
+    # store last_badge in xp table
+    xp, lvl, _ = get_or_create_xp(telegram_id, team_name)
+    set_xp(telegram_id, team_name, xp, lvl, code)
+    return True
+
+def maybe_award_condition_badges(telegram_id: int, team_name: str, wk: str, done_days_for_week: List[int], weekly_streak_full: int, was_zero_last_week: bool, monday_logged: bool) -> List[str]:
+    earned = []
+    if set(done_days_for_week) == {1,2,3}:
+        if award_badge(telegram_id, team_name, "FIRST_FULL_WEEK", wk):
+            earned.append("FIRST_FULL_WEEK")
+    if weekly_streak_full >= 4:
+        if award_badge(telegram_id, team_name, "FOUR_WEEK_STREAK", wk):
+            earned.append("FOUR_WEEK_STREAK")
+    if monday_logged:
+        if award_badge(telegram_id, team_name, "EARLY_BIRD", wk):
+            earned.append("EARLY_BIRD")
+    if was_zero_last_week and set(done_days_for_week) == {1,2,3}:
+        if award_badge(telegram_id, team_name, "COMEBACK", wk):
+            earned.append("COMEBACK")
+    return earned
+
+
+def load_programs() -> Dict[str, List[Dict]]:
+    """Return {program_name: [steps...]}; each step is a dict with title,url,tags,duration."""
+    if not GS_ENABLED or not WS_PROGRAMS:
+        return {}
+    ensure_program_headers()
+    rows = _get_records(WS_PROGRAMS)
+    prog: Dict[str, List[Dict]] = {}
+    for r in rows:
+        name = str(r.get("program","")).strip()
+        try:
+            step = int(str(r.get("step","")).strip())
+        except Exception:
+            continue
+        title = str(r.get("title","")).strip()
+        url = str(r.get("url","")).strip()
+        tags = str(r.get("tags","")).strip()
+        duration = str(r.get("duration","")).strip()
+        if name and step and url:
+            prog.setdefault(name, []).append({"step": step, "title": title, "url": url, "tags": tags, "duration": duration})
+    for k in list(prog.keys()):
+        prog[k] = sorted(prog[k], key=lambda x: x["step"])
+    return prog
+
+def get_enrollment(telegram_id: int) -> Optional[Tuple[str,int]]:
+    conn = db(); c = conn.cursor()
+    c.execute("SELECT program, step_index FROM program_enrollments WHERE telegram_id=?", (telegram_id,))
+    row = c.fetchone(); conn.close()
+    return (row[0], row[1]) if row else None
+
+def set_enrollment(telegram_id: int, program: str, step_index: int):
+    conn = db(); c = conn.cursor()
+    c.execute("""REPLACE INTO program_enrollments(telegram_id,program,step_index)
+                 VALUES (?,?,?)""",(telegram_id, program, step_index))
+    conn.commit(); conn.close()
+    if GS_ENABLED and WS_PROG_ENROLL:
+        ensure_program_headers()
+        rows = _get_records(WS_PROG_ENROLL)
+        found = False
+        for idx, r in enumerate(rows, start=2):
+            if str(r.get("telegram_id","")).strip() == str(telegram_id):
+                WS_PROG_ENROLL.update(f"A{idx}:C{idx}", [[str(telegram_id), program, step_index]])
+                found = True; break
+        if not found:
+            WS_PROG_ENROLL.append_row([str(telegram_id), program, step_index])
+
+async def programs_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    progs = load_programs()
+    if not progs:
+        await update.message.reply_text("No programs yet. Ask a leader to add rows in the *Programs* sheet.")
+        return
+    names = sorted(progs.keys())
+    lines = ["*Available Programs*", ""]
+    for n in names:
+        lines.append(f"• {n}  ({len(progs[n])} steps)")
+    lines += ["", "Start one:", "`/program_start <ProgramName>`"]
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+async def program_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("Usage: /program_start <ProgramName>")
+        return
+    name = " ".join(context.args).strip()
+    progs = load_programs()
+    if name not in progs:
+        await update.message.reply_text("Program not found. See `/programs`.")
+        return
+    set_enrollment(update.effective_user.id, name, 1)
+    step = progs[name][0]
+    label = step["title"] or f"Step 1"
+    await update.message.reply_text(
+        f"🎓 *Program started:* {name}\n*Step 1:* {label}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"▶️ {label}", url=step["url"])]])
+    )
+
+async def program_next(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    enroll = get_enrollment(update.effective_user.id)
+    if not enroll:
+        await update.message.reply_text("You’re not enrolled in a program. Use `/programs` then `/program_start <Name>`.")
+        return
+    name, idx = enroll
+    progs = load_programs()
+    steps = progs.get(name, [])
+    if not steps:
+        await update.message.reply_text("This program has no steps. Ask a leader to fill the *Programs* sheet.")
+        return
+    if idx >= len(steps):
+        await update.message.reply_text(f"🎉 You’ve finished *{name}*! Use `/programs` to pick another.")
+        return
+    step = steps[idx]
+    set_enrollment(update.effective_user.id, name, idx+1)
+    label = step["title"] or f"Step {idx+1}"
+    await update.message.reply_text(
+        f"*{name} — Step {idx+1}:* {label}",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"▶️ {label}", url=step['url'])]])
+    )
+
+async def program_status(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    enroll = get_enrollment(update.effective_user.id)
+    if not enroll:
+        await update.message.reply_text("No current program. Use `/programs` to see options.")
+        return
+    name, idx = enroll
+    progs = load_programs()
+    total = len(progs.get(name, []))
+    await update.message.reply_text(f"🎓 Program: *{name}*  —  Step {idx}/{total}", parse_mode=ParseMode.MARKDOWN)
+
+async def program_stop(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    conn = db(); c = conn.cursor()
+    c.execute("DELETE FROM program_enrollments WHERE telegram_id=?", (update.effective_user.id,))
+    conn.commit(); conn.close()
+    if GS_ENABLED and WS_PROG_ENROLL:
+        rows = _get_records(WS_PROG_ENROLL)
+        for idx, r in enumerate(rows, start=2):
+            if str(r.get("telegram_id","")).strip() == str(update.effective_user.id):
+                WS_PROG_ENROLL.delete_rows(idx); break
+    await update.message.reply_text("Stopped your current program. Use `/programs` to start another.")
+
 
 def _clear_week_no_archive(week_iso: str):
     """Delete last week's rows from Checkins and DB without archiving (not recommended)."""
@@ -539,6 +801,54 @@ def hydrate_from_sheets():
         except Exception:
             pass
 
+        # XP
+    if GS_ENABLED and WS_XP:
+        ensure_xp_header()
+        for r in _get_records(WS_XP):
+            try:
+                tg = int(str(r.get("telegram_id","")).strip())
+                name = str(r.get("team_name","")).strip()
+                xp = int(str(r.get("xp","0")).strip() or "0")
+                lvl = int(str(r.get("level","1")).strip() or "1")
+                last_badge = str(r.get("last_badge","")).strip() or None
+                if tg and name:
+                    c.execute("""REPLACE INTO xp(telegram_id,team_name,xp,level,last_badge)
+                                 VALUES (?,?,?,?,?)""",(tg,name,xp,lvl,last_badge))
+            except Exception:
+                pass
+
+    # Badges (history)
+    if GS_ENABLED and WS_BADGES:
+        ensure_badges_header()
+        for r in _get_records(WS_BADGES):
+            try:
+                tg = int(str(r.get("telegram_id","")).strip())
+                name = str(r.get("team_name","")).strip()
+                code = str(r.get("badge_code","")).strip()
+                title = str(r.get("badge_title","")).strip() or BADGE_TITLES.get(code, code)
+                ts = str(r.get("awarded_ts","")).strip()
+                wk = str(r.get("week_start","")).strip()
+                if tg and name and code and ts:
+                    c.execute("""INSERT OR IGNORE INTO badges(telegram_id,team_name,badge_code,badge_title,awarded_ts,week_start)
+                                 VALUES (?,?,?,?,?,?)""",(tg,name,code,title,ts,wk))
+            except Exception:
+                pass
+
+    # Program enrollments
+    if GS_ENABLED and WS_PROG_ENROLL:
+        ensure_program_headers()
+        for r in _get_records(WS_PROG_ENROLL):
+            try:
+                tg = int(str(r.get("telegram_id","")).strip())
+                program = str(r.get("program","")).strip()
+                step_index = int(str(r.get("step_index","1")).strip() or "1")
+                if tg and program:
+                    c.execute("""REPLACE INTO program_enrollments(telegram_id,program,step_index)
+                                 VALUES (?,?,?)""",(tg,program,step_index))
+            except Exception:
+                pass
+
+
     conn.commit(); conn.close()
     log.info("Hydrated local state from Google Sheets.")
 
@@ -651,8 +961,13 @@ async def help_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "/videos [filter] — Browse practice videos (e.g., /videos warmup)\n"
         "/addvideo <title> | <url> | [tags] | [duration]  (admin)\n"
         "/delvideo <url>  or  /delvideo --all <url>      (admin)\n"
-        "/whoami — Show your Telegram ID\n" \
-        "/roster — who is registered (names)\n"
+        "/whoami — Show your Telegram ID\n" 
+        "/roster — who is registered (names)\n" 
+        "/programs — list programs\n" 
+        "/program_start <Name> — enroll & get Step 1\n" 
+        "/program_next — next step\n" 
+        "/program_status — where you are\n" 
+        "/program_stop — leave the program\n" 
         "/roster_ids — registered names + IDs (admin)\n"
         "/nocheckins — who hasn’t checked in this week\n"
         "(All reminder times are interpreted in Pacific Time.)"
@@ -766,16 +1081,14 @@ async def cb_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ts = now.isoformat(timespec="seconds")
     local_date = now.date().isoformat()
 
-    # Block more than one check-in in the same calendar day
+    # Daily guard
     c.execute("SELECT 1 FROM checkins WHERE telegram_id=? AND local_date=?", (user.id, local_date))
     if c.fetchone():
         conn.close()
-        await q.edit_message_text(
-            f"You’ve already checked in today ({local_date}). Please come back tomorrow."
-        )
+        await q.edit_message_text(f"You’ve already checked in today ({local_date}). Please come back tomorrow.")
         return
 
-    # Enforce consecutive order within the week (Day 1 -> Day 2 -> Day 3)
+    # Consecutive order guard
     c.execute("SELECT DISTINCT day FROM checkins WHERE telegram_id=? AND week_start=?", (user.id, wk))
     done_days = sorted([d for (d,) in c.fetchall()])
     next_needed = (max(done_days) + 1) if done_days else 1
@@ -787,32 +1100,100 @@ async def cb_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Insert
     try:
-        c.execute(
-            """INSERT INTO checkins(telegram_id, team_name, week_start, day, minutes, ts, local_date)
-               VALUES (?,?,?,?,?,?,?)""",
-            (user.id, team_name, wk, day, DEFAULT_MINUTES, ts, local_date),
-        )
+        c.execute("""INSERT INTO checkins(telegram_id, team_name, week_start, day, minutes, ts, local_date)
+                     VALUES (?,?,?,?,?,?,?)""",(user.id, team_name, wk, day, DEFAULT_MINUTES, ts, local_date))
         conn.commit()
-        msg = f"Logged {team_name}: Day {day} ✅ ({DEFAULT_MINUTES} min)"
-        log_to_sheet(team_name, day, DEFAULT_MINUTES, ts, wk, user.id)
+        logged_ok = True
     except sqlite3.IntegrityError:
-        msg = f"{team_name}: Day {day} already logged this week."
-    # Celebrate if this makes 3/3
+        logged_ok = False
+
+    # Count this week after insert
     c.execute("SELECT COUNT(DISTINCT day) FROM checkins WHERE telegram_id=? AND week_start=?", (user.id, wk))
     cnt = c.fetchone()[0]
+
+    # Compute streak & monday flag & zero-last-week for badges
+    # Weekly full streak
+    streak_full = 0
+    c.execute("""SELECT week_start, COUNT(DISTINCT day) FROM checkins
+                 WHERE team_name=? GROUP BY week_start ORDER BY week_start DESC""", (team_name,))
+    for wk_i, n_days in c.fetchall():
+        if n_days == 3:
+            streak_full += 1
+        else:
+            break
+    # Was last week zero?
+    today = now.date()
+    this_week_start = today - datetime.timedelta(days=today.weekday())
+    last_week_start = (this_week_start - datetime.timedelta(days=7)).isoformat()
+    c.execute("""SELECT COUNT(*) FROM checkins WHERE team_name=? AND week_start=?""", (team_name, last_week_start))
+    was_zero_last_week = (c.fetchone()[0] == 0)
+    # Monday logged?
+    monday_logged = (now.weekday() == 0)
+
     conn.close()
 
+    # Log to Sheets
+    if logged_ok:
+        log_to_sheet(team_name, day, DEFAULT_MINUTES, ts, wk, user.id)
+
+    # --- XP & badges ---
+    # Base XP for each check-in
+    xp, lvl, _lb = get_or_create_xp(user.id, team_name)
+    before_lvl = lvl
+    xp += XP_PER_CHECKIN
+    lvl = level_for_xp(xp)
+    set_xp(user.id, team_name, xp, lvl, None)
+
+    # Maybe award badges based on conditions
+    earned_codes = maybe_award_condition_badges(
+        user.id, team_name, wk, sorted(done_days + ([day] if logged_ok else [])),
+        weekly_streak_full=streak_full, was_zero_last_week=was_zero_last_week, monday_logged=monday_logged
+    )
+
+    # DM the reward card
+    bar = xp_progress_bar(xp)
+    nxt = next_threshold(xp)
+    dm_lines = [
+        f"🏅 *Great job, {team_name}!* You logged *Day {day}*.",
+        f"+{XP_PER_CHECKIN} XP  |  Total: *{xp} XP*  |  Level: *{lvl}*",
+        f"`{bar}`  _Next level at {nxt} XP_",
+    ]
+    if earned_codes:
+        badges_txt = ", ".join([BADGE_TITLES.get(c, c) for c in earned_codes])
+        dm_lines.append(f"🎖️ *Badge unlocked:* {badges_txt}")
+    try:
+        await context.bot.send_message(chat_id=user.id, text="\n".join(dm_lines), parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        pass
+
+    # Edit the original button message
+    msg = f"Logged {team_name}: Day {day} ✅ ({DEFAULT_MINUTES} min)" if logged_ok else f"{team_name}: Day {day} already logged this week."
     await q.edit_message_text(msg)
 
+    # Group celebration: finishing 3/3
     if cnt == 3 and GROUP_CHAT_ID:
         try:
             party = random.choice(["🎉", "🙌", "✨", "🎊", "🔥"])
-            text = f"{party} *{team_name}* just completed all 3 practices this week! Give them some love in the chat! {party}"
+            extra = ""
+            if "FIRST_FULL_WEEK" in earned_codes:
+                extra = " — *First full week!* 🥇"
+            text = f"{party} *{team_name}* just completed all 3 practices this week! {extra}"
             await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=text, parse_mode=ParseMode.MARKDOWN)
+            # XP bonus for full week
+            xp2, lvl2, _ = get_or_create_xp(user.id, team_name)
+            xp2 += XP_BONUS_FULL_WEEK
+            new_lvl = level_for_xp(xp2)
+            set_xp(user.id, team_name, xp2, new_lvl, None)
+            if new_lvl > lvl2:
+                try:
+                    await context.bot.send_message(chat_id=user.id,
+                        text=f"✨ *Weekly bonus:* +{XP_BONUS_FULL_WEEK} XP\nLevel up! → *Level {new_lvl}*", parse_mode=ParseMode.MARKDOWN)
+                except Exception:
+                    pass
         except Exception:
             pass
-
 
 
 async def week(update: Update, _: ContextTypes.DEFAULT_TYPE):
@@ -1266,6 +1647,11 @@ def main():
 
     # Handlers
     app.add_handler(CommandHandler("chatid", chatid))
+    app.add_handler(CommandHandler("programs", programs_cmd))
+    app.add_handler(CommandHandler("program_start", program_start))
+    app.add_handler(CommandHandler("program_next", program_next))
+    app.add_handler(CommandHandler("program_status", program_status))
+    app.add_handler(CommandHandler("program_stop", program_stop))
 
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("start", start))
