@@ -19,8 +19,10 @@ from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
     JobQueue,
+    filters,
 )
 
 # ---------------- Logging ----------------
@@ -88,6 +90,9 @@ DEFAULT_MINUTES = int(os.getenv("DEFAULT_MINUTES", "20"))
 # ...
 VIDEOS_PER_PAGE = int(os.getenv("VIDEOS_PER_PAGE", "8"))  # change 8 → 10/12 if you like
 
+# Weekly rollover behavior (archive = copy to CheckinsArchive + clear; clear = just delete from Checkins)
+AUTO_ARCHIVE_PREV_WEEK = os.getenv("AUTO_ARCHIVE_PREV_WEEK", "true").lower() in ("true", "1", "yes")
+AUTO_CLEAR_PREV_WEEK = os.getenv("AUTO_CLEAR_PREV_WEEK", "false").lower() in ("true", "1", "yes")
 
 # Timezone (Pacific)
 try:
@@ -310,10 +315,10 @@ def load_videos() -> List[Dict]:
     except Exception:
         return []
 
-def log_to_sheet(team_name: str, day: int, minutes: int, ts_iso: str, week_start_iso: str, telegram_id: int):
+def log_to_sheet(team_name: str, day: int, minutes: int, ts_iso: str, week_start_iso: str, telegram_id: int, practice_note: str = ""):
     if not GS_ENABLED:
         return
-    _append_row(WS_CHECKINS, [team_name, f"Day {day}", minutes, ts_iso, week_start_iso, str(telegram_id)])
+    _append_row(WS_CHECKINS, [team_name, f"Day {day}", minutes, ts_iso, week_start_iso, str(telegram_id), practice_note])
 
 # ---------------- Database ----------------
 def db():
@@ -343,6 +348,7 @@ def init_db():
       minutes     INTEGER NOT NULL,
       ts          TEXT NOT NULL,
       local_date  TEXT,
+      practice_note TEXT,
       UNIQUE(telegram_id, week_start, day)
     )""")
 
@@ -397,6 +403,12 @@ def init_db():
             # If another instance already added it, or table missing in a race, just continue
             log.warning("Skipping local_date migration: %s", e)
 
+    if "practice_note" not in cols:
+        try:
+            c.execute("ALTER TABLE checkins ADD COLUMN practice_note TEXT")
+        except sqlite3.OperationalError as e:
+            log.warning("Skipping practice_note migration: %s", e)
+
     # Unique index to block two check-ins in one calendar day
     try:
         c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_checkins_daily ON checkins(telegram_id, local_date)")
@@ -412,7 +424,13 @@ WEEKDAY_MAP: Dict[str, int] = {"MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4,
 REV_WEEKDAY_MAP: Dict[int, str] = {v: k for k, v in WEEKDAY_MAP.items()}
 
 def week_start_iso(d: Optional[datetime.date] = None) -> str:
-    d = d or datetime.date.today()
+    if d is None:
+        # Get today's date in the local timezone (Pacific)
+        if LOCAL_TZ:
+            now = datetime.datetime.now(tz=LOCAL_TZ)
+            d = now.date()
+        else:
+            d = datetime.date.today()
     start = d - datetime.timedelta(days=d.weekday())  # Monday
     return start.isoformat()
 
@@ -446,7 +464,7 @@ def _filter_videos_by_query(all_vids: List[Dict], q: str) -> List[Dict]:
     ]
 
 def _archive_and_clear_week(week_iso: str):
-    """Copy last week's rows from Checkins -> CheckinsArchive, then clear them (and DB)."""
+    """Copy last week's rows from Checkins -> CheckinsArchive, then clear from Sheets (keep DB for history)."""
     # Sheets side
     if GS_ENABLED and WS_CHECKINS:
         try:
@@ -471,13 +489,9 @@ def _archive_and_clear_week(week_iso: str):
         except Exception as e:
             log.warning(f"Archive step failed: {e}")
 
-    # DB side (optional cleanup)
-    try:
-        conn = db(); c = conn.cursor()
-        c.execute("DELETE FROM checkins WHERE week_start=?", (week_iso,))
-        conn.commit(); conn.close()
-    except Exception as e:
-        log.warning(f"DB cleanup for {week_iso} failed: {e}")
+    # DB side: KEEP data in database so /history command still works!
+    # Do NOT delete from database - historical data is needed for /history, /streaks, and analytics
+    log.info(f"Archived week {week_iso} to CheckinsArchive (database kept for history tracking)")
 
 
 def get_or_create_xp(telegram_id: int, team_name: str) -> Tuple[int,int,str]:
@@ -670,7 +684,7 @@ async def program_stop(update: Update, _: ContextTypes.DEFAULT_TYPE):
 
 
 def _clear_week_no_archive(week_iso: str):
-    """Delete last week's rows from Checkins and DB without archiving (not recommended)."""
+    """Clear last week's rows from Checkins sheet only (keep DB for history tracking)."""
     if GS_ENABLED and WS_CHECKINS:
         try:
             raw = WS_CHECKINS.get_all_values()
@@ -682,20 +696,23 @@ def _clear_week_no_archive(week_iso: str):
                 WS_CHECKINS.delete_rows(i)
         except Exception as e:
             log.warning(f"Sheet clear failed: {e}")
-    try:
-        conn = db(); c = conn.cursor()
-        c.execute("DELETE FROM checkins WHERE week_start=?", (week_iso,))
-        conn.commit(); conn.close()
-    except Exception as e:
-        log.warning(f"DB clear failed: {e}")
+
+    # DB side: KEEP data in database so /history command still works!
+    # Do NOT delete from database - historical data is needed for /history, /streaks, and analytics
+    log.info(f"Cleared week {week_iso} from sheets (database kept for history tracking)")
 
 
 from datetime import time as dtime
 
 def schedule_week_rollover(application: Application):
-    """Run every Monday 00:05 Pacific: archive/clear the *previous* week."""
+    """Run every Monday 05:00 Pacific: archive/clear the *previous* week."""
     def _job_selector(context: ContextTypes.DEFAULT_TYPE):
-        today = datetime.date.today()
+        # Get today's date in the local timezone (Pacific)
+        if LOCAL_TZ:
+            now = datetime.datetime.now(tz=LOCAL_TZ)
+            today = now.date()
+        else:
+            today = datetime.date.today()
         this_week_start = today - datetime.timedelta(days=today.weekday())  # Monday
         last_week_start = (this_week_start - datetime.timedelta(days=7)).isoformat()
         if AUTO_ARCHIVE_PREV_WEEK:
@@ -709,7 +726,7 @@ def schedule_week_rollover(application: Application):
     jq = ensure_job_queue(application)
     jq.run_daily(
         _job_selector,
-        time=dtime(hour=0, minute=5, tzinfo=LOCAL_TZ),  # 00:05 Pacific, cushion for midnight transitions
+        time=dtime(hour=5, minute=0, tzinfo=LOCAL_TZ),  # 05:00 AM Pacific - fresh week start
         days=(0,),  # Monday
         name="weekly-rollover",
     )
@@ -891,9 +908,20 @@ async def _send_bible_verse(context: ContextTypes.DEFAULT_TYPE):
         return
     # Pick by ISO week number so it rotates predictably week to week
     try:
-        wk = datetime.date.today().isocalendar()[1]  # 1..53
+        # Get today's date in the local timezone (Pacific)
+        if LOCAL_TZ:
+            now = datetime.datetime.now(tz=LOCAL_TZ)
+            today = now.date()
+        else:
+            today = datetime.date.today()
+        wk = today.isocalendar()[1]  # 1..53
     except Exception:
-        wk = int(datetime.date.today().strftime("%U"))  # fallback
+        if LOCAL_TZ:
+            now = datetime.datetime.now(tz=LOCAL_TZ)
+            today = now.date()
+        else:
+            today = datetime.date.today()
+        wk = int(today.strftime("%U"))  # fallback
     ref, verse = BIBLE_VERSES[wk % len(BIBLE_VERSES)]
     text = f"📖 *Weekly encouragement*\n_{ref}_\n“{verse}”"
     try:
@@ -1049,15 +1077,18 @@ async def checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     chat = update.effective_chat
 
-    # Always try to send buttons via DM (quiet)
+    # Always try to send prompt via DM (quiet)
     try:
         await context.bot.send_message(
             chat_id=user.id,
-            text="Tap the day you completed (20 min):",
-            reply_markup=kb_days(),
+            text="What did you practice today? (e.g., 'Scales', 'Breathing exercises', 'Songs')\n\nJust type your answer and then select the day.",
             disable_notification=True,
             allow_sending_without_reply=True,
         )
+        # Store user state to indicate we're waiting for practice description
+        if context.user_data is None:
+            context.user_data = {}
+        context.user_data['waiting_for_practice_desc'] = True
     except Exception:
         await update.message.reply_text(
             "Please DM me first with /start, then try /checkin again.",
@@ -1080,6 +1111,32 @@ async def checkin(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.job_queue.run_once(_delete_after, when=5, data={"chat_id": chat.id, "msg_id": m.message_id})
         except Exception:
             pass
+
+async def handle_practice_description(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Capture practice description and show day buttons."""
+    user = update.effective_user
+
+    # Check if user is in the waiting_for_practice_desc state
+    if not (context.user_data and context.user_data.get('waiting_for_practice_desc')):
+        return
+
+    # Store the practice description
+    practice_note = update.message.text.strip()
+    context.user_data['practice_desc'] = practice_note
+    context.user_data['waiting_for_practice_desc'] = False
+
+    # Send day selection buttons
+    try:
+        await context.bot.send_message(
+            chat_id=user.id,
+            text=f"📝 Got it: *{practice_note}*\n\nNow tap the day you completed (20 min):",
+            reply_markup=kb_days(),
+            parse_mode=ParseMode.MARKDOWN,
+            disable_notification=True,
+            allow_sending_without_reply=True,
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Error: {e}")
 
 async def cb_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -1121,10 +1178,13 @@ async def cb_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # Get practice description from user_data
+    practice_note = context.user_data.get('practice_desc', '') if context.user_data else ''
+
     # Insert
     try:
-        c.execute("""INSERT INTO checkins(telegram_id, team_name, week_start, day, minutes, ts, local_date)
-                     VALUES (?,?,?,?,?,?,?)""",(user.id, team_name, wk, day, DEFAULT_MINUTES, ts, local_date))
+        c.execute("""INSERT INTO checkins(telegram_id, team_name, week_start, day, minutes, ts, local_date, practice_note)
+                     VALUES (?,?,?,?,?,?,?,?)""",(user.id, team_name, wk, day, DEFAULT_MINUTES, ts, local_date, practice_note))
         conn.commit()
         logged_ok = True
     except sqlite3.IntegrityError:
@@ -1157,7 +1217,7 @@ async def cb_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Log to Sheets
     if logged_ok:
-        log_to_sheet(team_name, day, DEFAULT_MINUTES, ts, wk, user.id)
+        log_to_sheet(team_name, day, DEFAULT_MINUTES, ts, wk, user.id, practice_note)
 
     # --- XP & badges ---
     # Base XP for each check-in
@@ -1178,9 +1238,13 @@ async def cb_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
     nxt = next_threshold(xp)
     dm_lines = [
         f"🏅 *Great job, {team_name}!* You logged *Day {day}*.",
+    ]
+    if practice_note:
+        dm_lines.append(f"📝 Practiced: _{practice_note}_")
+    dm_lines.extend([
         f"+{XP_PER_CHECKIN} XP  |  Total: *{xp} XP*  |  Level: *{lvl}*",
         f"`{bar}`  _Next level at {nxt} XP_",
-    ]
+    ])
     if earned_codes:
         badges_txt = ", ".join([BADGE_TITLES.get(c, c) for c in earned_codes])
         dm_lines.append(f"🎖️ *Badge unlocked:* {badges_txt}")
@@ -1190,7 +1254,13 @@ async def cb_day(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
     # Edit the original button message
-    msg = f"Logged {team_name}: Day {day} ✅ ({DEFAULT_MINUTES} min)" if logged_ok else f"{team_name}: Day {day} already logged this week."
+    if logged_ok:
+        if practice_note:
+            msg = f"Logged {team_name}: Day {day} ✅ ({DEFAULT_MINUTES} min)\n📝 {practice_note}"
+        else:
+            msg = f"Logged {team_name}: Day {day} ✅ ({DEFAULT_MINUTES} min)"
+    else:
+        msg = f"{team_name}: Day {day} already logged this week."
     await q.edit_message_text(msg)
 
     # Group celebration: finishing 3/3
@@ -1680,6 +1750,8 @@ def main():
     app.add_handler(CommandHandler("whoami", whoami))
     app.add_handler(CommandHandler("register", register))
     app.add_handler(CommandHandler("checkin", checkin))
+    # Message handler for practice description input (high priority, before other handlers)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_practice_description))
     app.add_handler(CallbackQueryHandler(cb_day, pattern=r"^day:\d$"))
     app.add_handler(CommandHandler("week", week))
     app.add_handler(CommandHandler("leaderboard", leaderboard))
