@@ -1003,6 +1003,7 @@ async def help_cmd(update: Update, _: ContextTypes.DEFAULT_TYPE):
         "/leaderboard — Weekly standings\n"
         "/streaks — Consecutive full weeks (3/3)\n"
         "/history — Last 4 weeks summary\n"
+        "/practices — See what team practiced this week\n"
         "/remind <DAYS> <HH:MM> — Personal DM reminders (Pacific)\n"
         "/myreminders — Show your reminder schedule\n"
         "/stopreminders — Turn off your reminders\n"
@@ -1444,6 +1445,37 @@ async def history(update: Update, _: ContextTypes.DEFAULT_TYPE):
     conn.close()
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
+async def practices(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    """Show what the team practiced this week."""
+    wk = week_start_iso()
+    conn = db(); c = conn.cursor()
+
+    # Get all practice logs for this week ordered by day
+    c.execute("""SELECT team_name, day, practice_note FROM checkins
+                 WHERE week_start=? ORDER BY day, team_name""", (wk,))
+    rows = c.fetchall()
+    conn.close()
+
+    lines = [f"*Weekly Practice Log*", f"Week: {wk} → {week_end_iso(wk)}", ""]
+
+    if not rows:
+        lines.append("_No practices logged yet this week._")
+    else:
+        current_day = None
+        for team_name, day, practice_note in rows:
+            if day != current_day:
+                if current_day is not None:
+                    lines.append("")
+                lines.append(f"*Day {day}*")
+                current_day = day
+
+            if practice_note:
+                lines.append(f"  • {team_name}: _{practice_note}_")
+            else:
+                lines.append(f"  • {team_name}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
 # ---------------- Personal Reminders ----------------
 from datetime import time as dtime
 
@@ -1759,6 +1791,7 @@ def main():
     app.add_handler(CommandHandler("undo", undo))
     app.add_handler(CommandHandler("streaks", streaks))
     app.add_handler(CommandHandler("history", history))
+    app.add_handler(CommandHandler("practices", practices))
     app.add_handler(CommandHandler("remind", remind))
     app.add_handler(CommandHandler("myreminders", myreminders))
     app.add_handler(CommandHandler("stopreminders", stopreminders))
