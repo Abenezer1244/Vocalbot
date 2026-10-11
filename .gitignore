@@ -5,3 +5,5 @@ __pycache__/
 progress.db
 *.db
 data/
+.railway/node_modules/
+.venv/

@@ -1,34 +1,28 @@
-# Vocal Practice Telegram Bot
+# Vocal Team Reminder Bot
 
-A Telegram bot for worship/vocal teams to track 20-minute practice sessions (3× per week), with check-ins, weekly table, leaderboard, personal DM reminders (Pacific Time), undo, streaks, history, and optional Google Sheets mirroring.
+Posts the team's weekly reminders in the Telegram group automatically. No commands.
 
-## Features
-- `/register <Name>` — map your Telegram to a roster name
-- `/checkin` → buttons for **Day 1 / Day 2 / Day 3** (20 min)
-- `/week` — live weekly table
-- `/leaderboard` — weekly standings (0–3)
-- `/me` — your progress this week
-- `/undo` — undo your last check-in this week
-- `/streaks` — consecutive full weeks (3/3)
-- `/history` — last 4 weeks summary
-- **Personal reminders (Pacific time)**:  
-  `/remind MON,WED,FRI 19:30`, `/myreminders`, `/stopreminders`
-- `/timezone` — shows reminder timezone (America/Los_Angeles)
-- Optional: mirror check-ins to Google Sheets tab **“Checkins”**
+| When (Pacific) | Message |
+|---|---|
+| Saturday 6:00 PM | Send all 4 songs by Monday |
+| Monday 9:00 AM | Songs are due today |
+| Thursday 5:00 PM | Practice tonight at 7:00 PM |
+| Saturday 3:00 PM | Practice today at 5:00 PM |
 
-## Roster
-Edit the `TEAM` list in `vocal_bot.py` to match your singers.
+To add or change a reminder, edit `GROUP_SCHEDULE` at the top of `vocal_bot.py`.
 
----
+## Settings
+- `BOT_TOKEN`: from @BotFather
+- `GROUP_CHAT_ID`: the team group's ID (negative, starts with `-100…`)
 
-## Quick Start (Local)
+## Run
+```bash
+pip install -r requirements.txt
+python vocal_bot.py
+```
+Hosted on Railway (`.railway/railway.ts`), start command `python vocal_bot.py`.
 
-1. **Bot token**
-   - In Telegram → **@BotFather** → `/newbot` → copy `BOT_TOKEN`
-   - `/setprivacy` → choose your bot → **Disable** (so it sees commands in groups)
-
-2. **Env & install**
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate           # Windows: .venv\Scripts\activate
-   pip install -r requirements.txt
+## Test
+```bash
+python test_vocal_bot.py
+```
