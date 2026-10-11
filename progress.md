@@ -173,3 +173,21 @@ The user asked to remove every command, including videos, programs and Google Sh
 - Deployed the 48-line reminders-only `vocal_bot.py`. The logs show "4 reminders scheduled" (SAT 18:00, MON 09:00, THU 17:00, SAT 15:00 Pacific), and polling works.
 - The volume, `DB_PATH` and `ADMIN_IDS` are now unused. They're kept until the user decides to remove them.
 - Nothing is committed yet.
+
+---
+
+## 2026-10-11 (schedule change, deploy blocked)
+
+### Summary
+Moved the "send all 4 songs by Monday" reminder from Saturday to Sunday at the user's request. Railway rejected the deploy because the account's trial has expired.
+
+### Changes
+- `vocal_bot.py`: `GROUP_SCHEDULE` entry `("SAT", "18:00", ...)` → `("SUN", "14:00", ...)` (user changed 18:00 to 2 PM). `test_vocal_bot.py` passes.
+- The change is only local: not committed and not deployed.
+
+### Decisions
+- Sunday 14:00 Pacific, same message text.
+
+### Next Steps
+- The user needs to pick a Railway plan (Hobby, $5/mo). Then run `railway up --service vocalbot --detach`, check that the logs show `Added job "SUN 14:00"`, and commit and push.
+- Until then the old deploy (Saturday 18:00) keeps running, and Railway may stop it at any time.

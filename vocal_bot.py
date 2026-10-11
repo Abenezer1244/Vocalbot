@@ -22,7 +22,7 @@ TZ = ZoneInfo("America/Los_Angeles")
 
 # Automatic group reminders: (day, "HH:MM" Pacific, message). Add a line to add a reminder.
 GROUP_SCHEDULE = [
-    ("SAT", "18:00", "🎵 Heads-up: please send all 4 songs for this week by Monday!"),
+    ("SUN", "14:00", "🎵 Heads-up: please send all 4 songs for this week by Monday!"),
     ("MON", "09:00", "🎵 Songs are due today — please send all 4 songs!"),
     ("THU", "17:00", "🎤 Practice tonight at 7:00 PM!"),
     ("SAT", "15:00", "🎤 Practice today at 5:00 PM!"),
