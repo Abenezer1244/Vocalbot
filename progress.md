@@ -191,3 +191,23 @@ Moved the "send all 4 songs by Monday" reminder from Saturday to Sunday at the u
 ### Next Steps
 - The user needs to pick a Railway plan (Hobby, $5/mo). Then run `railway up --service vocalbot --detach`, check that the logs show `Added job "SUN 14:00"`, and commit and push.
 - Until then the old deploy (Saturday 18:00) keeps running, and Railway may stop it at any time.
+
+---
+
+## 2026-10-11 (bot token leaked in logs)
+
+### Summary
+Railway logs showed the full bot token in every line. httpx logs each Telegram API request at INFO, and the request URL contains the token. Fixed in code, committed and pushed (`fb7cedd`). Not redeployed: the `railway up` attempt was blocked by the session's permission rules (production deploy), and the Railway trial has also expired (see the entry above).
+
+### Changes
+- `vocal_bot.py`: `logging.getLogger("httpx").setLevel(logging.WARNING)`. Verified that httpx INFO logging is suppressed; `test_vocal_bot.py` passes.
+- Commit `fb7cedd` "Stop logging the bot token" is pushed to origin/main. It sits on top of `c627f79` (the Sunday 14:00 schedule change, committed by the other session).
+
+### Decisions
+- The leaked token must be replaced, not just hidden: it's in past Railway logs and in this session's transcript.
+- Railway has no GitHub source (`source: null`), so pushing doesn't deploy; it needs `railway up`.
+
+### Next Steps (user)
+1. In @BotFather, send `/revoke` → @Worshipjesus_bot and copy the new token.
+2. Set it on Railway: `railway variables --set BOT_TOKEN=<new token>`.
+3. Pick a Railway plan (trial expired), then deploy with `railway up --service vocalbot --detach`. Check that the logs show only the startup lines (no `getUpdates` URLs) and `Added job "SUN 14:00"`.
