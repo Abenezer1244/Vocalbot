@@ -166,3 +166,10 @@ The user asked to remove every command, including videos, programs and Google Sh
 - Set GROUP_CHAT_ID on Railway to the group's `-100…` ID (the Railway session asked the user for it), then deploy.
 - The Railway /data volume and DB_PATH, ADMIN_IDS, SHEETS_ID and GOOGLE_* are no longer used. Removing the volume is the user's call.
 - Commit (not done yet).
+
+### Update (same day): reminders-only bot live
+- The old bot @YesuWayBot was deleted in BotFather. A new bot, @Worshipjesus_bot, has its token set on Railway.
+- `GROUP_CHAT_ID` is set to the "yesuway worship" group (read from the new bot's getUpdates once it was added).
+- Deployed the 48-line reminders-only `vocal_bot.py`. The logs show "4 reminders scheduled" (SAT 18:00, MON 09:00, THU 17:00, SAT 15:00 Pacific), and polling works.
+- The volume, `DB_PATH` and `ADMIN_IDS` are now unused. They're kept until the user decides to remove them.
+- Nothing is committed yet.

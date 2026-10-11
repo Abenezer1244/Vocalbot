@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.db
+.env
+service_account.json
+.railway/node_modules/
