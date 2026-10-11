@@ -208,6 +208,6 @@ Railway logs showed the full bot token in every line. httpx logs each Telegram A
 - Railway has no GitHub source (`source: null`), so pushing doesn't deploy; it needs `railway up`.
 
 ### Next Steps (user)
-1. In @BotFather, send `/revoke` → @Worshipjesus_bot and copy the new token.
-2. Set it on Railway: `railway variables --set BOT_TOKEN=<new token>`.
+1. ~~Revoke the token~~: the user decided to keep the current token (2026-10-11). If the bot ever posts something unexpected, revoke it in @BotFather.
+2. ~~Set the new token on Railway~~: not needed, since the token is kept.
 3. Pick a Railway plan (trial expired), then deploy with `railway up --service vocalbot --detach`. Check that the logs show only the startup lines (no `getUpdates` URLs) and `Added job "SUN 14:00"`.
