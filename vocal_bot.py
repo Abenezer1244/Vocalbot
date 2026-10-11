@@ -9,6 +9,7 @@ from telegram.ext import Application, ContextTypes
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s | %(message)s", level=logging.INFO)
 log = logging.getLogger("vocal-bot")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # httpx logs every request URL, which contains the bot token
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
