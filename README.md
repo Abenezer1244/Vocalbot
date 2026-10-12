@@ -1,6 +1,6 @@
 # Vocal Team Reminder Bot
 
-Posts the team's weekly reminders in the Telegram group automatically. No commands.
+Posts the team's weekly reminders in the Telegram group automatically, and welcomes new members (edit `WELCOME` in `vocal_bot.py`). No commands.
 
 | When (Pacific) | Message |
 |---|---|

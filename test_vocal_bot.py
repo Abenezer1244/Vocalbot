@@ -14,4 +14,13 @@ for job in jobs:
     day, hhmm = job.name.split()
     nxt = job.job.trigger.get_next_fire_time(None, now)
     assert (nxt.strftime("%a").upper(), nxt.strftime("%H:%M")) == (day, hhmm), (job.name, nxt)
+
+# Welcome: greets each new human member by first name, skips bots.
+import asyncio
+from types import SimpleNamespace as NS
+sent = []
+async def reply_text(text): sent.append(text)
+members = [NS(is_bot=False, first_name="Sara"), NS(is_bot=True, first_name="SomeBot")]
+asyncio.run(vb.welcome(NS(message=NS(new_chat_members=members, reply_text=reply_text)), None))
+assert len(sent) == 1 and "Welcome to the worship team, Sara!" in sent[0], sent
 print("OK")

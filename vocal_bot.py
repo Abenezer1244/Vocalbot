@@ -1,11 +1,12 @@
-# vocal_bot.py — posts the team's weekly reminders in the Telegram group automatically. No commands.
+# vocal_bot.py — posts the team's weekly reminders in the Telegram group and welcomes new members. No commands.
 import os
 import logging
 import datetime
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from telegram.ext import Application, ContextTypes
+from telegram import Update
+from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s | %(message)s", level=logging.INFO)
 log = logging.getLogger("vocal-bot")
@@ -31,6 +32,16 @@ GROUP_SCHEDULE = [
 ]
 DAYS = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"]  # PTB run_daily numbers days 0=Sunday
 
+# Posted when someone joins the group. {name} is the new member's first name.
+WELCOME = """👋 Welcome to the worship team, {name}! We're glad you're here 🙏
+
+Here's how our week works:
+🎵 Each week we pick 4 songs. Please send them by Monday.
+🙏 The leader for the week prepares a word to share with the congregation.
+🎤 Practice is Thursday at 7:00 PM and Saturday at 5:00 PM.
+
+I'll post reminders here so nobody misses anything. Feel free to ask the team if you have any questions!"""
+
 async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_message(GROUP_CHAT_ID, context.job.data)
 
@@ -40,11 +51,18 @@ def schedule_reminders(app: Application):
         app.job_queue.run_daily(send_reminder, time=datetime.time(h, m, tzinfo=TZ),
                                 days=(DAYS.index(day),), data=text, name=f"{day} {hhmm}")
 
+async def welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    for member in update.message.new_chat_members:
+        if not member.is_bot:
+            await update.message.reply_text(WELCOME.format(name=member.first_name))
+
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     schedule_reminders(app)
+    # Join notices reach bots even with privacy mode on, so no BotFather change is needed
+    app.add_handler(MessageHandler(filters.Chat(GROUP_CHAT_ID) & filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome))
     log.info("Bot starting: %d reminders scheduled for chat %s.", len(GROUP_SCHEDULE), GROUP_CHAT_ID)
-    app.run_polling()  # keeps the process alive for the scheduler; there are no handlers
+    app.run_polling()  # keeps the process alive for the scheduler and the welcome handler
 
 if __name__ == "__main__":
     main()
