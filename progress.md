@@ -211,3 +211,17 @@ Railway logs showed the full bot token in every line. httpx logs each Telegram A
 1. ~~Revoke the token~~: the user decided to keep the current token (2026-10-11). If the bot ever posts something unexpected, revoke it in @BotFather.
 2. ~~Set the new token on Railway~~: not needed, since the token is kept.
 3. Pick a Railway plan (trial expired), then deploy with `railway up --service vocalbot --detach`. Check that the logs show only the startup lines (no `getUpdates` URLs) and `Added job "SUN 14:00"`.
+
+---
+
+## 2026-10-12 (deployed to Railway)
+
+### Summary
+Deployed `main` (`dee6102`) to Railway with `railway up --service vocalbot --detach` (deployment `1c9105c7`, status SUCCESS). The Railway plan issue is resolved.
+
+### Changes
+- No code changes. Logs show `Added job "SUN 14:00"`, `MON 09:00`, `THU 17:00`, `SAT 15:00` for chat -1003829676258, and no more token-bearing `getUpdates` lines.
+- One `Conflict: terminated by other getUpdates request` at 15:10:10 while the old deploy shut down. None after that.
+
+### Next Steps
+- If `Conflict` errors keep repeating, something else is polling with the same token (e.g. a local `python vocal_bot.py`).

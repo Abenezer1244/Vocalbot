@@ -4,8 +4,9 @@ Posts the team's weekly reminders in the Telegram group automatically. No comman
 
 | When (Pacific) | Message |
 |---|---|
-| Saturday 6:00 PM | Send all 4 songs by Monday |
+| Sunday 2:00 PM | Send all 4 songs by Monday |
 | Monday 9:00 AM | Songs are due today |
+| Wednesday 9:00 PM | Leader: have you prepared a word to share? |
 | Thursday 5:00 PM | Practice tonight at 7:00 PM |
 | Saturday 3:00 PM | Practice today at 5:00 PM |
 
