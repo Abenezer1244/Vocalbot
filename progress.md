@@ -1,5 +1,25 @@
 # Progress
 
+## 2026-10-24
+
+### Summary
+Added two weekly "Nuggets" posts to `vocal_bot.py` with stage and leading tips for the team.
+
+### Changes
+- `vocal_bot.py`: two new `GROUP_SCHEDULE` entries.
+  - Monday 11:00: leading tips (talk with the congregation by praying, sharing the prepared word, inviting them to stand; stay flexible with the Spirit and change songs on the spot if led).
+  - Tuesday 11:00: stage tips (hold the mic straight in front of your mouth; supporters stand on the green tape).
+- `test_vocal_bot.py` passes with all 7 jobs firing on their named weekday and time (run through `uv run --with-requirements requirements.txt`, because system `python` and `py` are broken or missing dependencies).
+
+### Decisions
+- The user named the tips "Nuggets" and chose Monday and Tuesday at 11:00. Leading tips go on Monday and stage tips on Tuesday.
+- The earlier note about `vocal_bot.py` assuming 0=Monday (so jobs ran one day early) is resolved: `DAYS` uses PTB's 0=Sunday numbering, and the test checks every entry.
+
+### Next Steps
+- Not committed or deployed yet. Commit, push, and redeploy to Railway once the user approves.
+
+---
+
 ## 2026-10-11
 
 ### Summary

@@ -26,6 +26,12 @@ TZ = ZoneInfo("America/Los_Angeles")
 GROUP_SCHEDULE = [
     ("SUN", "14:00", "🎵 Heads-up: please send all 4 songs for this week by Monday!"),
     ("MON", "09:00", "🎵 Songs are due today — please send all 4 songs!"),
+    ("MON", "11:00", "💎 Nuggets:\n\n"
+                     "🗣️ While leading, talk with the congregation: pray, share the word you prepared, invite them to stand, and more.\n"
+                     "🕊️ Don't just sing what you prepared. Be flexible with the Spirit and change it on the spot if you feel led."),
+    ("TUE", "11:00", "💎 Nuggets:\n\n"
+                     "🎤 Hold the mic straight in front of your mouth.\n"
+                     "📍 Supporters: make sure you stand lined up on the green tape on the stage."),
     ("WED", "21:00", "🙏 To this week's leader: have you prepared a word to share with the congregation?"),
     ("THU", "17:00", "🎤 Practice tonight at 7:00 PM!"),
     ("SAT", "15:00", "🎤 Practice today at 5:00 PM!"),
